@@ -162,7 +162,7 @@ docs = [
   "mkdocs-material==9.7.1",
   "mkdocs-macros-plugin==1.5.0",
   "mkdocs-simple-hooks==0.1.5",
-  "pymdown-extensions==10.20.1",
+  "pymdown-extensions==10.21.3",
   # NOTE: [imaging] extra removed because it pins pillow<12.0, conflicting with pillow==12.1.1 (security fix).
   # Image optimization for docs is not critical. Re-add when mkdocs-material supports Pillow 12+.
   # "mkdocs-material[imaging]==9.7.1",
