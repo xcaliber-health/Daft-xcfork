@@ -2339,6 +2339,7 @@ dependencies = [
  "daft-functions-utf8",
  "daft-geo",
  "daft-hash",
+ "daft-iceberg",
  "daft-image",
  "daft-io",
  "daft-json",
@@ -2915,6 +2916,21 @@ dependencies = [
  "serde",
  "sha1",
  "xxhash-rust",
+]
+
+[[package]]
+name = "daft-iceberg"
+version = "0.3.0-dev0"
+dependencies = [
+ "arrow",
+ "arrow-array 57.3.0",
+ "arrow-schema 57.3.0",
+ "common-arrow-ffi",
+ "common-error",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

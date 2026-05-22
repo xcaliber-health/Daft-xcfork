@@ -282,6 +282,79 @@ class IcebergTable(Table):
 
         df.write_iceberg(self._inner, mode="overwrite")
 
+    def rewrite_data_files(
+        self,
+        strategy: str = "binpack",
+        *,
+        sort_order: list[tuple[str, str, str]] | None = None,
+        zorder_by: list[str] | None = None,
+        where: Any | None = None,
+        branch: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Compact or re-cluster data files in this table.
+
+        `strategy` is one of:
+            - ``"binpack"``: consolidate small/skewed files into target-sized files.
+            - ``"sort"``: sort by ``sort_order`` (list of ``(column, asc|desc, nulls-first|nulls-last)``).
+            - ``"zorder"``: spatially cluster on ``zorder_by`` columns via z-order curve.
+
+        `where` filters candidate files via pyiceberg's expression language. `branch`
+        targets a non-default branch. `options` is a dict of tuning knobs; see the
+        docs for the full table.
+
+        Returns a ``RewriteResult`` summarizing files removed, files added, and the
+        commit's ``rewrite_id`` (used for idempotent replay).
+
+        Equality deletes anywhere in the scanned scope raise
+        ``daft.daft.EqualityDeletesPresentError`` — apply them first.
+
+        Examples
+        --------
+        >>> table.rewrite_data_files("binpack")  # doctest: +SKIP
+        >>> table.rewrite_data_files(  # doctest: +SKIP
+        ...     "sort",
+        ...     sort_order=[("event_ts", "asc", "nulls-last")],
+        ... )
+        >>> table.rewrite_data_files(  # doctest: +SKIP
+        ...     "zorder",
+        ...     zorder_by=["lat", "lon"],
+        ...     where="region = 'us'",
+        ... )
+        """
+        from daft.io.iceberg._compact import run
+
+        return run(
+            self._inner,
+            strategy=strategy,
+            sort_order=sort_order,
+            zorder_by=zorder_by,
+            where=where,
+            branch=branch,
+            options=options,
+        )
+
+    def compact_files(
+        self,
+        *,
+        where: Any | None = None,
+        branch: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Compact small files. Alias for ``rewrite_data_files("binpack", ...)``.
+
+        Examples
+        --------
+        >>> table.compact_files()  # doctest: +SKIP
+        >>> table.compact_files(where="region = 'us'")  # doctest: +SKIP
+        """
+        return self.rewrite_data_files(
+            "binpack",
+            where=where,
+            branch=branch,
+            options=options,
+        )
+
 
 def _to_pyiceberg_ident(ident: Identifier | str) -> tuple[str, ...] | str:
     return tuple(ident) if isinstance(ident, Identifier) else ident

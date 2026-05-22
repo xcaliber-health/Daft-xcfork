@@ -1,0 +1,21 @@
+[package]
+name = "daft-iceberg"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow = {workspace = true}
+arrow-array = {workspace = true}
+arrow-schema = {workspace = true}
+common-arrow-ffi = {path = "../common/arrow-ffi", optional = true}
+common-error = {path = "../common/error", default-features = false}
+pyo3 = {workspace = true, optional = true}
+serde = {workspace = true}
+serde_json = {workspace = true}
+thiserror = {workspace = true}
+
+[features]
+python = ["dep:pyo3", "dep:common-arrow-ffi"]
+
+[lints]
+workspace = true
