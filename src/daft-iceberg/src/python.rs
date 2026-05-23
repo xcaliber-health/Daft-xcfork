@@ -66,6 +66,9 @@ fn parse_options(py_opts: &Bound<'_, PyDict>) -> PyResult<RewriteOptions> {
     if let Some(v) = get_opt!(py_opts, "partial-progress.max-commits", u32) {
         o.partial_progress_max_commits = v;
     }
+    if let Some(v) = get_opt!(py_opts, "partial-progress.max-failed-commits", u32) {
+        o.partial_progress_max_failed_commits = Some(v);
+    }
     if let Some(v) = get_opt!(py_opts, "max-concurrent-file-group-rewrites", u32) {
         o.max_concurrent_file_group_rewrites = v;
     }
@@ -74,6 +77,18 @@ fn parse_options(py_opts: &Bound<'_, PyDict>) -> PyResult<RewriteOptions> {
     }
     if let Some(v) = get_opt!(py_opts, "use-starting-sequence-number", bool) {
         o.use_starting_sequence_number = v;
+    }
+    if let Some(v) = get_opt!(py_opts, "remove-dangling-deletes", bool) {
+        o.remove_dangling_deletes = v;
+    }
+    if let Some(v) = get_opt!(py_opts, "max-files-to-rewrite", u32) {
+        o.max_files_to_rewrite = Some(v);
+    }
+    if let Some(v) = get_opt!(py_opts, "min-file-size-bytes", u64) {
+        o.min_file_size_bytes = Some(v);
+    }
+    if let Some(v) = get_opt!(py_opts, "max-file-size-bytes", u64) {
+        o.max_file_size_bytes = Some(v);
     }
     if let Some(v) = get_opt!(py_opts, "rewrite-job-order", String) {
         o.job_order = JobOrder::parse(&v).map_err(err_to_py)?;
@@ -179,6 +194,10 @@ fn validate_options_py<'py>(
         o.partial_progress_max_commits,
     )?;
     d.set_item(
+        "partial-progress.max-failed-commits",
+        o.effective_max_failed_commits(),
+    )?;
+    d.set_item(
         "max-concurrent-file-group-rewrites",
         o.max_concurrent_file_group_rewrites,
     )?;
@@ -190,6 +209,12 @@ fn validate_options_py<'py>(
         "use-starting-sequence-number",
         o.use_starting_sequence_number,
     )?;
+    d.set_item("remove-dangling-deletes", o.remove_dangling_deletes)?;
+    if let Some(v) = o.max_files_to_rewrite {
+        d.set_item("max-files-to-rewrite", v)?;
+    }
+    d.set_item("min-file-size-bytes", o.effective_min_file_size_bytes())?;
+    d.set_item("max-file-size-bytes", o.effective_max_file_size_bytes())?;
     d.set_item(
         "rewrite-job-order",
         match o.job_order {

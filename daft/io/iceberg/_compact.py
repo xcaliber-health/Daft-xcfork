@@ -1,9 +1,4 @@
-"""Iceberg `rewrite_data_files` orchestration.
-
-Drives candidate enumeration via pyiceberg, file-group planning via the Rust crate,
-per-group read+write via Daft's existing read/write pipeline, and atomic commit via
-pyiceberg's overwrite snapshot.
-"""
+"""rewrite_data_files orchestration: candidate enumeration, planning, read+write, commit."""
 
 from __future__ import annotations
 
@@ -22,20 +17,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Equality-delete refusal mirrors Iceberg's RewriteDataFilesSparkAction semantics:
-# applying equality deletes during compaction would require an equality-delete reader,
-# which is not implemented. Users must rewrite equality deletes into positional
-# deletes (or apply them) before compacting.
+# Equality deletes are rejected up front; users must apply them before compacting.
 EqualityDeletesPresent = _rust_iceberg.EqualityDeletesPresentError
 
 
 class RewriteConflict(RuntimeError):
-    """Raised when a concurrent transaction removed input files mid-retry.
-
-    Output files have already been written to the data root but cannot safely be
-    committed — another rewrite already replaced part of our input. The message
-    lists the orphaned output paths so the operator can clean them up.
-    """
+    """Concurrent writer removed input files mid-retry; outputs are orphaned."""
 
 
 SUPPORTED_STRATEGIES = ("binpack", "sort", "zorder")
@@ -51,14 +38,54 @@ SNAPSHOT_PROP_BATCH = "daft.rewrite-batch"
 _COMMIT_MAX_ATTEMPTS = 4
 _COMMIT_BACKOFF_BASE_SECONDS = 0.1
 
+_STARTING_SEQ_NUMBER_WARNED = False
+
+
+def _warn_unused_starting_sequence_number_once() -> None:
+    global _STARTING_SEQ_NUMBER_WARNED
+    if _STARTING_SEQ_NUMBER_WARNED:
+        return
+    _STARTING_SEQ_NUMBER_WARNED = True
+    import warnings
+
+    warnings.warn(
+        "rewrite_data_files: option `use-starting-sequence-number` is accepted but "
+        "currently a no-op; default sequencing applies.",
+        stacklevel=3,
+    )
+
 
 @dataclass(frozen=True)
 class RewriteResult:
-    """Outcome of a `rewrite_data_files` call.
+    """Summary of a rewrite_data_files invocation.
 
-    `rewritten_files` and `bytes_rewritten` count data files removed; `added_files` and
-    `bytes_added` count data files written. `failed_groups` is non-zero only under
-    partial-progress mode when one or more batched commits exhausted retries.
+    Parameters
+    ----------
+    strategy
+        The strategy applied: ``"binpack"``, ``"sort"``, or ``"zorder"``.
+    rewritten_files
+        Number of input data files removed by the rewrite.
+    added_files
+        Number of output data files written.
+    bytes_rewritten
+        Total size in bytes of the removed data files.
+    bytes_added
+        Total size in bytes of the written data files.
+    removed_delete_files
+        Number of positional delete files consumed during read, plus any deletes
+        dropped by ``remove-dangling-deletes`` post-processing.
+    failed_groups
+        Number of file groups whose batched commit exhausted retries. Non-zero
+        only when ``partial-progress.enabled=true``.
+    commits
+        Number of snapshots produced. Always ``1`` in atomic mode; up to
+        ``partial-progress.max-commits`` otherwise.
+    snapshot_ids
+        Snapshot IDs created by this call, in commit order.
+    rewrite_id
+        Stable identifier used for idempotent replay.
+    failed_data_files
+        Same as ``failed_groups`` but counted at file granularity.
     """
 
     strategy: str
@@ -71,6 +98,11 @@ class RewriteResult:
     commits: int
     snapshot_ids: list[int] = field(default_factory=list)
     rewrite_id: str = ""
+    failed_data_files: int = 0
+
+
+class RewriteFailedException(RuntimeError):
+    """Rewrite could not make forward progress."""
 
 
 def run(
@@ -82,10 +114,6 @@ def run(
     branch: str | None,
     options: dict[str, Any] | None,
 ) -> RewriteResult:
-    """Execute a `rewrite_data_files` action against `table`.
-
-    Single-commit path. Partial-progress and OCC retry land in M4.
-    """
     from pyiceberg.expressions import AlwaysTrue
     from pyiceberg.manifest import DataFileContent
 
@@ -103,10 +131,13 @@ def run(
     raw_options = options or {}
     normalized = _rust_iceberg.validate_options_py(raw_options)
 
+    if "use-starting-sequence-number" in raw_options:
+        _warn_unused_starting_sequence_number_once()
+
     row_filter = where if where is not None else AlwaysTrue()
     scan_kwargs: dict[str, Any] = {"row_filter": row_filter}
     if branch is not None:
-        scan_kwargs["snapshot_id"] = table.snapshot_for_ref(branch).snapshot_id  # type: ignore[union-attr]
+        scan_kwargs["snapshot_id"] = table.snapshot_by_name(branch).snapshot_id  # type: ignore[union-attr]
     scan = table.scan(**scan_kwargs)
     plan_files = list(scan.plan_files())
 
@@ -167,27 +198,94 @@ def run(
             rewrite_id=rewrite_id,
         )
 
-    outputs: list[_GroupOutput] = []
-    for idx, group in enumerate(groups):
-        outputs.append(
-            _rewrite_group(
-                table=table,
-                group=group,
-                group_index=idx,
-                normalized_options=normalized,
-                strategy=strategy,
-                sort_order=parsed_sort_order,
-                zorder_by=parsed_zorder_by,
-            )
-        )
+    max_concurrent = max(
+        1, int(normalized.get("max-concurrent-file-group-rewrites", 1))
+    )
+    outputs = _rewrite_groups_concurrent(
+        table=table,
+        groups=groups,
+        normalized_options=normalized,
+        strategy=strategy,
+        sort_order=parsed_sort_order,
+        zorder_by=parsed_zorder_by,
+        max_workers=max_concurrent,
+    )
 
-    return _commit(
+    result = _commit(
         table=table,
         outputs=outputs,
         plan_by_path=plan_by_path,
         rewrite_id=rewrite_id,
         strategy=strategy,
         normalized_options=normalized,
+        branch=branch,
+    )
+
+    if normalized.get("remove-dangling-deletes"):
+        removed = _remove_dangling_deletes(table, branch=branch)
+        if removed:
+            result = _augment_result_with_dangling(result, removed)
+    return result
+
+
+def _rewrite_groups_concurrent(
+    *,
+    table: PyIcebergTable,
+    groups: list[dict[str, Any]],
+    normalized_options: dict[str, Any],
+    strategy: str,
+    sort_order: list[tuple[str, bool, bool]] | None,
+    zorder_by: list[str] | None,
+    max_workers: int,
+) -> list[_GroupOutput]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    if max_workers <= 1 or len(groups) <= 1:
+        return [
+            _rewrite_group(
+                table=table,
+                group=g,
+                group_index=idx,
+                normalized_options=normalized_options,
+                strategy=strategy,
+                sort_order=sort_order,
+                zorder_by=zorder_by,
+            )
+            for idx, g in enumerate(groups)
+        ]
+
+    def _one(idx_group: tuple[int, dict[str, Any]]) -> _GroupOutput:
+        idx, g = idx_group
+        return _rewrite_group(
+            table=table,
+            group=g,
+            group_index=idx,
+            normalized_options=normalized_options,
+            strategy=strategy,
+            sort_order=sort_order,
+            zorder_by=zorder_by,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        outputs = list(pool.map(_one, list(enumerate(groups))))
+    return outputs
+
+
+def _augment_result_with_dangling(
+    result: RewriteResult, removed_delete_files: int
+) -> RewriteResult:
+    return RewriteResult(
+        strategy=result.strategy,
+        rewritten_files=result.rewritten_files,
+        added_files=result.added_files,
+        bytes_rewritten=result.bytes_rewritten,
+        bytes_added=result.bytes_added,
+        removed_delete_files=result.removed_delete_files + removed_delete_files,
+        failed_groups=result.failed_groups,
+        commits=result.commits,
+        snapshot_ids=result.snapshot_ids,
+        rewrite_id=result.rewrite_id,
+        failed_data_files=result.failed_data_files,
     )
 
 
@@ -284,11 +382,6 @@ def _rewrite_group(
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
 ) -> _GroupOutput:
-    """Read this group's input files, apply strategy transform, write field-id-aware parquet.
-
-    Sort and z-order share this code path with binpack — the only difference is the
-    per-group transform applied before splitting into target-sized chunks.
-    """
     from daft.expressions import col as col_expr
     from daft.expressions.expressions import ExpressionsProjection
     from daft.io.writer import IcebergWriter
@@ -300,6 +393,7 @@ def _rewrite_group(
     bytes_rewritten = sum(int(f["size_bytes"]) for f in group["files"])
 
     target_size = int(normalized_options["target-file-size-bytes"])
+    compression_factor = float(normalized_options.get("compression-factor", 1.0))
     output_root = _group_output_root(table, group, group_index)
 
     arrow_table = _to_arrow_for_paths(table, input_paths)
@@ -317,15 +411,16 @@ def _rewrite_group(
         assert zorder_by is not None
         mp = _apply_zorder(mp, arrow_table, zorder_by, normalized_options)
 
-    # Split into roughly target-size-aligned chunks. Uses input bytes as the size estimate;
-    # output bytes track this closely when compression behavior matches the inputs. After a
-    # sort, slicing the sorted MicroPartition contiguously preserves the within-file order.
-    n_chunks = max(1, (bytes_rewritten + target_size - 1) // target_size)
+    estimated_output_bytes = max(1, int(bytes_rewritten * compression_factor))
+    n_chunks = max(1, (estimated_output_bytes + target_size - 1) // target_size)
     chunks = _split_micropartition(mp, int(n_chunks))
 
-    spec = table.spec()
+    output_spec_id = int(group["output_spec_id"])
+    output_spec = table.specs()[output_spec_id]
     schema = table.schema()
     properties = table.properties
+
+    partition_values_rb = _build_partition_values_recordbatch(mp, output_spec, schema)
 
     data_files: list[Any] = []
     bytes_added = 0
@@ -337,8 +432,8 @@ def _rewrite_group(
             file_idx=idx,
             schema=schema,
             properties=properties,
-            partition_spec_id=spec.spec_id,
-            partition_values=None,
+            partition_spec_id=output_spec_id,
+            partition_values=partition_values_rb,
             io_config=None,
         )
         writer.write(chunk)
@@ -360,16 +455,34 @@ def _rewrite_group(
     )
 
 
+def _build_partition_values_recordbatch(
+    mp: Any,
+    output_spec: Any,
+    schema: Any,
+) -> Any | None:
+    from daft.expressions.expressions import ExpressionsProjection
+    from daft.io.iceberg.iceberg_write import partition_field_to_expr
+    from daft.recordbatch import RecordBatch as DaftRecordBatch
+
+    if not getattr(output_spec, "fields", None):
+        return None
+    if len(mp) == 0:
+        return None
+    # Group is partition-homogeneous; one row is representative of the whole group.
+    head_mp = mp.slice(0, 1)
+    proj = ExpressionsProjection(
+        [partition_field_to_expr(f, schema) for f in output_spec.fields]
+    )
+    transformed = head_mp.eval_expression_list(proj)
+    return DaftRecordBatch.from_arrow_table(transformed.to_arrow())
+
+
 def _apply_zorder(
     mp: Any,
     arrow_table: Any,
     zorder_by: list[str],
     normalized_options: dict[str, Any],
 ) -> Any:
-    """Build the synthetic z-order key, sort by it, drop it.
-
-    Returns a MicroPartition with the same schema as the input (key column projected away).
-    """
     from daft.expressions import col as col_expr
     from daft.expressions.expressions import ExpressionsProjection
     from daft.recordbatch import MicroPartition
@@ -394,7 +507,6 @@ def _apply_zorder(
 
 
 def _split_micropartition(mp: Any, n: int) -> list[Any]:
-    """Split a MicroPartition into roughly `n` evenly sized slices (row-wise)."""
     total = len(mp)
     if n <= 1 or total <= 1:
         return [mp]
@@ -405,8 +517,9 @@ def _split_micropartition(mp: Any, n: int) -> list[Any]:
     return out
 
 
+# Uses pyiceberg's ArrowScan because it resolves parquet columns by field-id
+# (required for schema evolution) and applies positional delete files.
 def _to_arrow_for_paths(table: PyIcebergTable, paths: list[str]):
-    """Read selected files (with positional deletes applied) into a single Arrow table."""
     from pyiceberg.io.pyarrow import ArrowScan
 
     scan = table.scan()
@@ -430,40 +543,17 @@ def _group_output_root(
 ) -> str:
     base = table.location().rstrip("/")
     suffix = uuid.uuid4().hex[:12]
-    # Sit alongside existing data; an extra subdir keeps writes isolated.
     return f"{base}/data/__daft_rewrite__/{group_index}-{suffix}"
 
 
-def _path_protocol(p: str) -> str | None:
-    if "://" in p:
-        return p.split("://", 1)[0]
-    return None
-
-
-def _read_parquet_metadata(path: str):
-    from daft.dependencies import pq
-
-    return pq.read_metadata(path)
-
-
+# pyiceberg Records are positional with no named attrs; iterate the tuple values.
 def _stable_partition_key(record: Any) -> str:
-    """Canonical JSON encoding of an Iceberg partition Record (sorted by field name)."""
     if record is None:
-        return "{}"
+        return "[]"
     try:
-        items = {}
-        for name in dir(record):
-            if name.startswith("_"):
-                continue
-            try:
-                v = getattr(record, name)
-            except Exception:
-                continue
-            if callable(v):
-                continue
-            items[name] = _json_safe(v)
-        return json.dumps(items, sort_keys=True, default=str)
-    except Exception:
+        values = [_json_safe(v) for v in tuple(record)]
+        return json.dumps(values, default=str)
+    except TypeError:
         return json.dumps(str(record))
 
 
@@ -471,27 +561,6 @@ def _json_safe(v: Any) -> Any:
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
     return str(v)
-
-
-def _record_from_partition_key(table: PyIcebergTable, partition_key: str):
-    """Reconstruct an Iceberg partition Record from a candidate's `partition_key`.
-
-    For unpartitioned tables this returns an empty Record. Partitioned tables look up
-    the field order from the current spec and fill in values by name.
-    """
-    from pyiceberg.typedef import Record as IcebergRecord
-
-    spec = table.spec()
-    if not spec.fields:
-        return IcebergRecord()
-    payload = json.loads(partition_key) if partition_key else {}
-    if not isinstance(payload, dict):
-        return IcebergRecord()
-    values = [payload.get(f.name) for f in spec.fields]
-    try:
-        return IcebergRecord(*values)
-    except TypeError:
-        return IcebergRecord(**{f.name: payload.get(f.name) for f in spec.fields})
 
 
 def _resolve_rewrite_id(
@@ -519,7 +588,6 @@ def _resolve_rewrite_id(
 
 
 def _summary_as_dict(summary: Any) -> dict[str, str]:
-    """pyiceberg's Summary is dict-like but resists ``dict(s)``; flatten via attribute access."""
     if summary is None:
         return {}
     out: dict[str, str] = {}
@@ -537,14 +605,9 @@ def _lookup_idempotent_result(
     rewrite_id: str,
     strategy: str,
 ) -> RewriteResult | None:
-    """Reconstruct a `RewriteResult` from any prior snapshots tagged with `rewrite_id`.
-
-    Under partial-progress, one logical rewrite spans N snapshots — we aggregate every
-    match so a replay short-circuits even when the original run committed batched.
-    Look-back window: last 50 snapshots (configurable in a follow-up).
-    """
     snapshots = list(table.metadata.snapshots or [])
     matches: list[tuple[Any, dict[str, str]]] = []
+    # Last 50 snapshots is a pragmatic window covering even multi-batch partial-progress runs.
     for snap in snapshots[-50:]:
         summary = _summary_as_dict(snap.summary)
         if summary.get(SNAPSHOT_PROP_REWRITE_ID) == rewrite_id:
@@ -554,13 +617,12 @@ def _lookup_idempotent_result(
     rewritten_total = sum(int(s.get(SNAPSHOT_PROP_INPUT_FILES, 0)) for _, s in matches)
     added_total = sum(int(s.get(SNAPSHOT_PROP_OUTPUT_FILES, 0)) for _, s in matches)
     strat = matches[-1][1].get(SNAPSHOT_PROP_STRATEGY, strategy)
+    # bytes_* and removed_delete_files are not persisted in the snapshot summary, so
+    # idempotent replays surface counts but not sizes.
     return RewriteResult(
         strategy=strat,
         rewritten_files=rewritten_total,
         added_files=added_total,
-        # bytes_* and removed_delete_files are intentionally not persisted to the
-        # snapshot summary (would balloon it for large rewrites); replay reconstructs
-        # only what the summary carries.
         bytes_rewritten=0,
         bytes_added=0,
         removed_delete_files=0,
@@ -574,7 +636,6 @@ def _lookup_idempotent_result(
 def _find_batch_snapshot(
     table: PyIcebergTable, rewrite_id: str, batch_label: str
 ) -> Any | None:
-    """Locate a snapshot already committed for `(rewrite_id, batch_label)`, if any."""
     snapshots = list(table.metadata.snapshots or [])
     for snap in reversed(snapshots[-50:]):
         summary = _summary_as_dict(snap.summary)
@@ -594,6 +655,7 @@ def _commit(
     rewrite_id: str,
     strategy: str,
     normalized_options: dict[str, Any],
+    branch: str | None,
 ) -> RewriteResult:
     """Dispatch single-commit or partial-progress commit based on options."""
     if not outputs:
@@ -617,6 +679,13 @@ def _commit(
             rewrite_id=rewrite_id,
             strategy=strategy,
             max_commits=int(normalized_options["partial-progress.max-commits"]),
+            max_failed_commits=int(
+                normalized_options.get(
+                    "partial-progress.max-failed-commits",
+                    normalized_options["partial-progress.max-commits"],
+                )
+            ),
+            branch=branch,
         )
     return _commit_single(
         table=table,
@@ -624,6 +693,7 @@ def _commit(
         plan_by_path=plan_by_path,
         rewrite_id=rewrite_id,
         strategy=strategy,
+        branch=branch,
     )
 
 
@@ -634,8 +704,10 @@ def _commit_single(
     plan_by_path: dict[str, Any],
     rewrite_id: str,
     strategy: str,
+    branch: str | None,
 ) -> RewriteResult:
-    """Atomic single-transaction commit with OCC retry. Re-raises on exhaustion."""
+    from pyiceberg.exceptions import CommitFailedException
+
     result, err = _commit_batch(
         table=table,
         batch=outputs,
@@ -643,9 +715,16 @@ def _commit_single(
         rewrite_id=rewrite_id,
         strategy=strategy,
         batch_label=None,
+        branch=branch,
     )
     if result is None:
         assert err is not None
+        if isinstance(err, CommitFailedException):
+            raise RewriteFailedException(
+                "rewrite_data_files: atomic commit conflicted with a concurrent "
+                "snapshot after retries. To tolerate concurrent writers, set "
+                "options={'partial-progress.enabled': True}."
+            ) from err
         raise err
     return result
 
@@ -658,13 +737,9 @@ def _commit_partial(
     rewrite_id: str,
     strategy: str,
     max_commits: int,
+    max_failed_commits: int,
+    branch: str | None,
 ) -> RewriteResult:
-    """Split outputs into ≤ max_commits contiguous batches and commit each independently.
-
-    A batch that exhausts its retry budget or hits a `RewriteConflict` is logged with
-    its orphan output paths and counted in `failed_groups`; remaining batches still
-    commit. Group order is preserved (planner already sorted by `rewrite-job-order`).
-    """
     n_batches = min(max(1, int(max_commits)), len(outputs))
     chunk_size = (len(outputs) + n_batches - 1) // n_batches
     batches = [outputs[i : i + chunk_size] for i in range(0, len(outputs), chunk_size)]
@@ -676,6 +751,8 @@ def _commit_partial(
     agg_out_bytes = 0
     agg_removed_deletes = 0
     failed_groups = 0
+    failed_data_files = 0
+    failed_batches = 0
     snapshot_ids: list[int] = []
 
     for idx, batch in enumerate(batches):
@@ -687,6 +764,7 @@ def _commit_partial(
             rewrite_id=rewrite_id,
             strategy=strategy,
             batch_label=label,
+            branch=branch,
         )
         if result is None:
             orphan_paths = _orphan_output_paths(batch)
@@ -699,6 +777,8 @@ def _commit_partial(
                 orphan_paths,
             )
             failed_groups += len(batch)
+            failed_data_files += sum(len(o.input_data_files) for o in batch)
+            failed_batches += 1
             continue
         agg_rewritten += result.rewritten_files
         agg_added += result.added_files
@@ -706,6 +786,13 @@ def _commit_partial(
         agg_out_bytes += result.bytes_added
         agg_removed_deletes += result.removed_delete_files
         snapshot_ids.extend(result.snapshot_ids)
+
+    if failed_batches > max_failed_commits:
+        raise RewriteFailedException(
+            f"rewrite_data_files: {failed_batches} of {n_actual} batches failed "
+            f"(threshold partial-progress.max-failed-commits={max_failed_commits}). "
+            f"{len(snapshot_ids)} commit(s) landed; orphan outputs may need cleanup."
+        )
 
     return RewriteResult(
         strategy=strategy,
@@ -718,6 +805,7 @@ def _commit_partial(
         commits=len(snapshot_ids),
         snapshot_ids=snapshot_ids,
         rewrite_id=rewrite_id,
+        failed_data_files=failed_data_files,
     )
 
 
@@ -729,13 +817,8 @@ def _commit_batch(
     rewrite_id: str,
     strategy: str,
     batch_label: str | None,
+    branch: str | None,
 ) -> tuple[RewriteResult | None, Exception | None]:
-    """Atomically overwrite this batch's inputs with its outputs; retry on OCC conflict.
-
-    Returns `(result, None)` on success, `(None, last_exception)` after exhausting
-    `_COMMIT_MAX_ATTEMPTS`. A `RewriteConflict` (input files vanished mid-retry) is
-    raised inline — partial-progress callers must catch it.
-    """
     from pyiceberg.exceptions import CommitFailedException
 
     all_data_files = [df_ for o in batch for df_ in o.data_files]
@@ -785,8 +868,8 @@ def _commit_batch(
             if existing is not None:
                 return _success_result(int(existing.snapshot_id)), None
 
-        # After at least one failure, ensure the input files still exist. If a
-        # concurrent rewrite removed any, our outputs would orphan stale rows.
+        # Abort if a concurrent rewrite removed any of our input files — otherwise
+        # we'd append outputs whose rows no longer correspond to a live snapshot.
         if attempt > 0:
             live = {t.file.file_path for t in table.scan().plan_files()}
             missing = [p for p in input_paths if p not in live]
@@ -799,7 +882,10 @@ def _commit_batch(
 
         try:
             tx = table.transaction()
-            update = tx.update_snapshot(snapshot_properties=snapshot_props)
+            update_kwargs: dict[str, Any] = {"snapshot_properties": snapshot_props}
+            if branch is not None:
+                update_kwargs["branch"] = branch
+            update = tx.update_snapshot(**update_kwargs)
             with update.overwrite() as ow:
                 for p in input_paths:
                     task = plan_by_path[p]
@@ -808,7 +894,12 @@ def _commit_batch(
                     ow.append_data_file(df_)
             tx.commit_transaction()
             table.refresh()
-            snap = table.current_snapshot()
+            # current_snapshot() returns main's head, so resolve the branch explicitly.
+            snap = (
+                table.snapshot_by_name(branch)
+                if branch is not None
+                else table.current_snapshot()
+            )
             snapshot_id = int(snap.snapshot_id) if snap else 0
             return _success_result(snapshot_id), None
         except CommitFailedException as e:
@@ -820,8 +911,70 @@ def _commit_batch(
     return None, last_err
 
 
+def _remove_dangling_deletes(table: PyIcebergTable, branch: str | None) -> int:
+    """Drop delete files whose sequence number is at or below the partition's
+    minimum data-file sequence number.
+
+    A delete with no live data file at or after its sequence number can never
+    apply to anything, so removing it is safe. Commits a single snapshot. Returns
+    the number of delete files removed.
+    """
+    from pyiceberg.manifest import DataFileContent
+
+    table.refresh()
+    snap = (
+        table.snapshot_by_name(branch)
+        if branch is not None
+        else table.current_snapshot()
+    )
+    if snap is None:
+        return 0
+
+    min_data_seq: dict[tuple[int, str], int] = {}
+    delete_entries: dict[tuple[int, str], list[tuple[Any, int]]] = {}
+    for manifest in snap.manifests(table.io):
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True):
+            data_file = entry.data_file
+            seq = entry.sequence_number if entry.sequence_number is not None else 0
+            key = (
+                int(data_file.spec_id),
+                _stable_partition_key(data_file.partition),
+            )
+            if data_file.content == DataFileContent.DATA:
+                cur = min_data_seq.get(key)
+                if cur is None or seq < cur:
+                    min_data_seq[key] = seq
+            else:
+                delete_entries.setdefault(key, []).append((data_file, seq))
+
+    to_remove: list[Any] = []
+    for key, entries in delete_entries.items():
+        min_seq = min_data_seq.get(key)
+        for df_, seq in entries:
+            # min_seq is None when the partition holds only delete files.
+            if min_seq is None or seq <= min_seq:
+                to_remove.append(df_)
+
+    if not to_remove:
+        return 0
+
+    tx = table.transaction()
+    update_kwargs: dict[str, Any] = {
+        "snapshot_properties": {
+            "daft.rewrite-dangling-deletes-removed": str(len(to_remove)),
+        }
+    }
+    if branch is not None:
+        update_kwargs["branch"] = branch
+    with tx.update_snapshot(**update_kwargs).overwrite() as ow:
+        for df_ in to_remove:
+            ow.delete_data_file(df_)
+    tx.commit_transaction()
+    table.refresh()
+    return len(to_remove)
+
+
 def _orphan_output_paths(batch: list[_GroupOutput]) -> list[str]:
-    """Best-effort extraction of output file paths from a batch's `DataFile` objects."""
     out: list[str] = []
     for o in batch:
         for df_ in o.data_files:

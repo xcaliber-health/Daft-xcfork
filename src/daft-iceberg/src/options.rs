@@ -57,9 +57,14 @@ pub struct RewriteOptions {
     pub rewrite_all: bool,
     pub partial_progress_enabled: bool,
     pub partial_progress_max_commits: u32,
+    pub partial_progress_max_failed_commits: Option<u32>,
     pub max_concurrent_file_group_rewrites: u32,
     pub output_spec_id: Option<i32>,
     pub use_starting_sequence_number: bool,
+    pub remove_dangling_deletes: bool,
+    pub max_files_to_rewrite: Option<u32>,
+    pub min_file_size_bytes: Option<u64>,
+    pub max_file_size_bytes: Option<u64>,
     pub job_order: JobOrder,
     pub compression_factor: f64,
     pub zorder_max_output_size: u64,
@@ -76,14 +81,43 @@ impl Default for RewriteOptions {
             rewrite_all: false,
             partial_progress_enabled: false,
             partial_progress_max_commits: DEFAULT_MAX_COMMITS,
+            partial_progress_max_failed_commits: None,
             max_concurrent_file_group_rewrites: DEFAULT_MAX_CONCURRENT,
             output_spec_id: None,
             use_starting_sequence_number: true,
+            remove_dangling_deletes: false,
+            max_files_to_rewrite: None,
+            min_file_size_bytes: None,
+            max_file_size_bytes: None,
             job_order: JobOrder::BytesDesc,
             compression_factor: 1.0,
             zorder_max_output_size: DEFAULT_ZORDER_MAX_OUTPUT_SIZE,
             zorder_var_length_contribution: DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION,
         }
+    }
+}
+
+impl RewriteOptions {
+    /// Lower size threshold for rewrite eligibility. Defaults to 75% of target.
+    pub fn effective_min_file_size_bytes(&self) -> u64 {
+        match self.min_file_size_bytes {
+            Some(v) => v,
+            None => (self.target_file_size_bytes as f64 * 0.75) as u64,
+        }
+    }
+
+    /// Upper size threshold for rewrite eligibility. Defaults to 180% of target.
+    pub fn effective_max_file_size_bytes(&self) -> u64 {
+        match self.max_file_size_bytes {
+            Some(v) => v,
+            None => (self.target_file_size_bytes as f64 * 1.80) as u64,
+        }
+    }
+
+    /// Failed-commit budget under partial-progress. Defaults to `partial_progress_max_commits`.
+    pub fn effective_max_failed_commits(&self) -> u32 {
+        self.partial_progress_max_failed_commits
+            .unwrap_or(self.partial_progress_max_commits)
     }
 }
 
@@ -152,6 +186,47 @@ impl RewriteOptions {
                     self.zorder_var_length_contribution
                 ),
             ));
+        }
+        let lower = self.effective_min_file_size_bytes();
+        let upper = self.effective_max_file_size_bytes();
+        if lower >= self.target_file_size_bytes {
+            return Err(invalid(
+                "min-file-size-bytes",
+                format!(
+                    "must be < target-file-size-bytes ({}), got {}",
+                    self.target_file_size_bytes, lower
+                ),
+            ));
+        }
+        if upper <= self.target_file_size_bytes {
+            return Err(invalid(
+                "max-file-size-bytes",
+                format!(
+                    "must be > target-file-size-bytes ({}), got {}",
+                    self.target_file_size_bytes, upper
+                ),
+            ));
+        }
+        if let Some(cap) = self.max_files_to_rewrite {
+            if cap == 0 {
+                return Err(invalid(
+                    "max-files-to-rewrite",
+                    "must be >= 1 when set".into(),
+                ));
+            }
+        }
+        if self.partial_progress_enabled {
+            if let Some(mfc) = self.partial_progress_max_failed_commits {
+                if mfc > self.partial_progress_max_commits {
+                    return Err(invalid(
+                        "partial-progress.max-failed-commits",
+                        format!(
+                            "must be <= partial-progress.max-commits ({}), got {}",
+                            self.partial_progress_max_commits, mfc
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }

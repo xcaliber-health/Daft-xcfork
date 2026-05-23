@@ -74,9 +74,8 @@ pub fn plan_file_groups(
             .push(c);
     }
 
-    let target = opts.target_file_size_bytes as f64;
-    let lower = (target * 0.75) as u64;
-    let upper = (target * 1.80) as u64;
+    let lower = opts.effective_min_file_size_bytes();
+    let upper = opts.effective_max_file_size_bytes();
 
     let mut groups: Vec<FileGroup> = Vec::new();
     for ((part_key, spec_id), files) in buckets {
@@ -103,6 +102,23 @@ pub fn plan_file_groups(
     }
 
     sort_groups(&mut groups, opts.job_order);
+
+    // Drop trailing groups so the cumulative file count fits the cap.
+    if let Some(cap) = opts.max_files_to_rewrite {
+        let mut remaining = cap as usize;
+        let mut idx = 0;
+        while idx < groups.len() {
+            let n = groups[idx].files.len();
+            if n <= remaining {
+                remaining -= n;
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        groups.truncate(idx);
+    }
+
     Ok(groups)
 }
 
@@ -266,6 +282,74 @@ mod tests {
         ];
         let groups = plan_file_groups(candidates, &o, 0).unwrap();
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn max_files_to_rewrite_truncates_trailing_groups() {
+        let target = 64 * 1024 * 1024;
+        let o = RewriteOptions {
+            max_files_to_rewrite: Some(3),
+            job_order: JobOrder::BytesDesc,
+            ..opts(target, 2, 5 * target)
+        };
+        // Two partitions, two files each. After job-order sort the partition with
+        // larger files comes first; the cap of 3 keeps only that group entirely
+        // (2 files) and drops the second group (would push us over the cap).
+        let candidates = vec![
+            cf("/big0.parquet", 10_000_000, "p=a", 0),
+            cf("/big1.parquet", 10_000_000, "p=a", 0),
+            cf("/sm0.parquet", 1024, "p=b", 0),
+            cf("/sm1.parquet", 1024, "p=b", 0),
+        ];
+        let groups = plan_file_groups(candidates, &o, 0).unwrap();
+        let total_files: usize = groups.iter().map(|g| g.files.len()).sum();
+        assert!(total_files <= 3, "cap not honored: {} files in {} groups", total_files, groups.len());
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn configurable_min_max_file_size_changes_survivors() {
+        let target: u64 = 100 * 1024 * 1024;
+        // Defaults: lower=75MiB, upper=180MiB → a 60MiB file is undersized → planned.
+        // Override: lower=50MiB, upper=200MiB → 60MiB is well-sized → skipped.
+        let custom = RewriteOptions {
+            target_file_size_bytes: target,
+            max_file_group_size_bytes: 5 * target,
+            min_input_files: 2,
+            min_file_size_bytes: Some(50 * 1024 * 1024),
+            max_file_size_bytes: Some(200 * 1024 * 1024),
+            ..RewriteOptions::default()
+        };
+        let candidates = (0..3)
+            .map(|i| cf(&format!("/f{i}.parquet"), 60 * 1024 * 1024, "{}", 0))
+            .collect();
+        let groups = plan_file_groups(candidates, &custom, 0).unwrap();
+        assert!(
+            groups.is_empty(),
+            "60MiB files with min=50MiB should be considered well-sized and skipped"
+        );
+    }
+
+    #[test]
+    fn invalid_min_above_target_rejected() {
+        let o = RewriteOptions {
+            target_file_size_bytes: 100 * 1024 * 1024,
+            max_file_group_size_bytes: 5 * 100 * 1024 * 1024,
+            min_file_size_bytes: Some(200 * 1024 * 1024),
+            ..RewriteOptions::default()
+        };
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_max_below_target_rejected() {
+        let o = RewriteOptions {
+            target_file_size_bytes: 100 * 1024 * 1024,
+            max_file_group_size_bytes: 5 * 100 * 1024 * 1024,
+            max_file_size_bytes: Some(50 * 1024 * 1024),
+            ..RewriteOptions::default()
+        };
+        assert!(o.validate().is_err());
     }
 
     #[test]

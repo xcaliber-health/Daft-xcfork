@@ -111,6 +111,8 @@ def test_occ_retry_succeeds_on_transient_conflict(make_tiny_table, monkeypatch):
 
 
 def test_occ_retry_exhausts_and_raises(make_tiny_table, monkeypatch):
+    from daft.io.iceberg._compact import RewriteFailedException
+
     table = make_tiny_table(name="default.t_occ_exhaust", n_files=6, rows_per_file=3)
     pre_snaps = _snapshot_count(table)
 
@@ -120,9 +122,11 @@ def test_occ_retry_exhausts_and_raises(make_tiny_table, monkeypatch):
     counter = _patch_commit(monkeypatch, behavior)
 
     dt = Table.from_iceberg(table)
-    with pytest.raises(CommitFailedException):
+    with pytest.raises(RewriteFailedException) as exc_info:
         dt.compact_files(options={"rewrite-all": True, "min-input-files": 2})
 
+    assert "partial-progress" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, CommitFailedException)
     assert counter["n"] == 4, "expected exactly _COMMIT_MAX_ATTEMPTS attempts"
     assert _snapshot_count(table) == pre_snaps, "no snapshot must land on full failure"
 

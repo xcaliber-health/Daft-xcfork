@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from daft.datatype import DataType
 from daft.dependencies import pa, pacsv, pafs, pq
@@ -273,6 +273,45 @@ class CSVFileWriter(FileWriterBase):
         return RecordBatch.from_pydict(metadata)
 
 
+_ICEBERG_COMPRESSION_TO_PARQUET = {
+    "uncompressed": "none",
+    "none": "none",
+    "snappy": "snappy",
+    "gzip": "gzip",
+    "lz4": "lz4",
+    "brotli": "brotli",
+    "zstd": "zstd",
+}
+
+
+def _resolve_iceberg_writer_options(properties: dict[str, str] | None) -> dict[str, Any]:
+    """Translate Iceberg ``write.*`` table properties to ParquetWriter kwargs."""
+    props = properties or {}
+    fmt = (props.get("write.format-default") or "parquet").lower()
+    if fmt != "parquet":
+        raise ValueError(
+            f"IcebergWriter only supports parquet; got write.format-default={fmt!r}"
+        )
+
+    codec_raw = (props.get("write.parquet.compression-codec") or "zstd").lower()
+    codec = _ICEBERG_COMPRESSION_TO_PARQUET.get(codec_raw, codec_raw)
+
+    out: dict[str, Any] = {"compression": codec}
+    level = props.get("write.parquet.compression-level")
+    if level is not None:
+        out["compression_level"] = int(level)
+    row_group_bytes = props.get("write.parquet.row-group-size-bytes")
+    if row_group_bytes is not None:
+        out["row_group_byte_size"] = int(row_group_bytes)
+    page_size = props.get("write.parquet.page-size-bytes")
+    if page_size is not None:
+        out["data_page_size"] = int(page_size)
+    dict_size = props.get("write.parquet.dict-size-bytes")
+    if dict_size is not None:
+        out["dictionary_pagesize_limit"] = int(dict_size)
+    return out
+
+
 class IcebergWriter(ParquetFileWriter):
     def __init__(
         self,
@@ -286,11 +325,12 @@ class IcebergWriter(ParquetFileWriter):
     ):
         from pyiceberg.io.pyarrow import schema_to_pyarrow
 
+        self._iceberg_writer_opts = _resolve_iceberg_writer_options(dict(properties or {}))
         super().__init__(
             root_dir=root_dir,
             file_idx=file_idx,
             partition_values=partition_values,
-            compression="zstd",
+            compression=self._iceberg_writer_opts["compression"],
             io_config=io_config,
             version=None,
             default_partition_fallback="null",
@@ -305,6 +345,24 @@ class IcebergWriter(ParquetFileWriter):
         self.partition_spec_id = partition_spec_id
         self.properties = properties
 
+    def _create_writer(self, schema: pa.Schema) -> pq.ParquetWriter:
+        opts: dict[str, Any] = {}
+        if self.metadata_collector is not None:
+            opts["metadata_collector"] = self.metadata_collector
+        for k in ("compression_level", "data_page_size", "dictionary_pagesize_limit"):
+            v = self._iceberg_writer_opts.get(k)
+            if v is not None:
+                opts[k] = v
+        return pq.ParquetWriter(
+            self.full_path,
+            schema,
+            compression=self.compression,
+            use_compliant_nested_type=False,
+            filesystem=self.fs,
+            version="2.6",
+            **opts,
+        )
+
     def write(self, table: MicroPartition) -> int:
         assert not self.is_closed, "Cannot write to a closed IcebergFileWriter"
         if len(table) == 0:
@@ -312,7 +370,13 @@ class IcebergWriter(ParquetFileWriter):
         if self.current_writer is None:
             self.current_writer = self._create_writer(self.file_schema)
         casted = coerce_pyarrow_table_to_schema(table.to_arrow(), self.file_schema)
-        self.current_writer.write_table(casted)
+        row_group_byte_cap = self._iceberg_writer_opts.get("row_group_byte_size")
+        if row_group_byte_cap is not None and len(table) > 0:
+            approx_bytes_per_row = max(1, casted.nbytes // max(1, len(table)))
+            row_group_size = max(1, int(row_group_byte_cap // approx_bytes_per_row))
+            self.current_writer.write_table(casted, row_group_size=row_group_size)
+        else:
+            self.current_writer.write_table(casted)
 
         current_position = self.current_writer.file_handle.tell()
         bytes_written = current_position - self.position
