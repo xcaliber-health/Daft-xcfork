@@ -24,7 +24,15 @@ from pyiceberg.transforms import (
     YearTransform,
 )
 
-from daft.catalog import Catalog, Function, Identifier, NotFoundError, Properties, Schema, Table
+from daft.catalog import (
+    Catalog,
+    Function,
+    Identifier,
+    NotFoundError,
+    Properties,
+    Schema,
+    Table,
+)
 from daft.io.iceberg._iceberg import read_iceberg
 
 if TYPE_CHECKING:
@@ -38,7 +46,9 @@ class IcebergCatalog(Catalog):
     _inner: InnerCatalog
 
     def __init__(self) -> None:
-        raise RuntimeError("IcebergCatalog.__init__ is not supported, please use `Catalog.from_iceberg` instead.")
+        raise RuntimeError(
+            "IcebergCatalog.__init__ is not supported, please use `Catalog.from_iceberg` instead."
+        )
 
     @staticmethod
     def _from_obj(obj: object) -> IcebergCatalog:
@@ -126,7 +136,9 @@ class IcebergCatalog(Catalog):
                     width=pf.transform.width,
                 )
             else:
-                raise NotImplementedError(f"Unsupported partition transform: {pf.transform}")
+                raise NotImplementedError(
+                    f"Unsupported partition transform: {pf.transform}"
+                )
 
             iceberg_partition_fields.append(
                 PyIcebergPartitionField(
@@ -142,7 +154,9 @@ class IcebergCatalog(Catalog):
     # create_*
     ###
 
-    def _create_function(self, ident: Identifier, function: Function | Callable[..., Any]) -> None:
+    def _create_function(
+        self, ident: Identifier, function: Function | Callable[..., Any]
+    ) -> None:
         raise NotImplementedError("Iceberg does not support function registration.")
 
     def _get_function(self, ident: Identifier) -> Function:
@@ -161,8 +175,12 @@ class IcebergCatalog(Catalog):
     ) -> Table:
         i = _to_pyiceberg_ident(identifier)
         pa_schema = schema.to_pyarrow_schema()
-        iceberg_schema = assign_fresh_schema_ids(_pyarrow_to_schema_without_ids(pa_schema))
-        partition_spec = self._partition_fields_to_pyiceberg_spec(iceberg_schema, partition_fields)
+        iceberg_schema = assign_fresh_schema_ids(
+            _pyarrow_to_schema_without_ids(pa_schema)
+        )
+        partition_spec = self._partition_fields_to_pyiceberg_spec(
+            iceberg_schema, partition_fields
+        )
         t = IcebergTable.__new__(IcebergTable)
         if partition_spec is not None:
             t._inner = self._inner.create_table(
@@ -223,7 +241,9 @@ class IcebergCatalog(Catalog):
             raise NotFoundError() from ex
         except Exception as ex:
             # wrap original exceptions
-            raise Exception("pyiceberg raised an exception while calling get_table") from ex
+            raise Exception(
+                "pyiceberg raised an exception while calling get_table"
+            ) from ex
 
     ###
     # list_*
@@ -250,7 +270,9 @@ class IcebergTable(Table):
     _write_options: set[str] = set()
 
     def __init__(self) -> None:
-        raise RuntimeError("IcebergTable.__init__ is not supported, please use `Table.from_iceberg` instead.")
+        raise RuntimeError(
+            "IcebergTable.__init__ is not supported, please use `Table.from_iceberg` instead."
+        )
 
     @property
     def name(self) -> str:
@@ -331,6 +353,79 @@ class IcebergTable(Table):
             zorder_by=zorder_by,
             where=where,
             branch=branch,
+            options=options,
+        )
+
+    def expire_snapshots(
+        self,
+        *,
+        older_than: Any | None = None,
+        retain_last: int | None = None,
+        snapshot_ids: list[int] | None = None,
+        clean_expired_files: bool = True,
+        stream_results: bool = False,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Expire old snapshots and reclaim their files.
+
+        Parameters
+        ----------
+        older_than : datetime.datetime or int, optional
+            Expire snapshots with a timestamp strictly older than this value.
+            ``int`` is treated as epoch milliseconds. If no retention argument is
+            supplied at all, the table property ``history.expire.max-snapshot-age-ms``
+            (default 5 days) is used to compute a default ``older_than``.
+        retain_last : int, optional
+            Always retain the N most-recent snapshots reachable from the current
+            ref. The table property ``history.expire.min-snapshots-to-keep`` acts
+            as a floor — the effective retention is ``max(retain_last, floor)``.
+        snapshot_ids : list of int, optional
+            Explicit IDs to expire. Branch and tag heads are always protected and
+            raise ``ValueError`` if listed here.
+        clean_expired_files : bool, default True
+            When ``True``, physically delete files (data, position deletes,
+            equality deletes, manifests, manifest lists, statistics) that become
+            unreachable. When ``False``, only the snapshot metadata is removed.
+        stream_results : bool, default False
+            Stream candidate file paths through a generator instead of materializing
+            them. Bounds memory at the per-snapshot manifest size; the kept-files
+            set remains in memory.
+        options : dict, optional
+            Tuning knobs:
+
+            - ``max-concurrent-deletes`` (int, default 4)
+            - ``max-concurrent-manifest-reads`` (int, default 4)
+            - ``delete-num-retries`` (int, default 3)
+            - ``delete-backoff-base-seconds`` (float, default 0.1)
+
+        Returns
+        -------
+        ExpireResult
+            Counts of files removed, broken out by file type.
+
+        Raises
+        ------
+        ValueError
+            If the table property ``gc.enabled`` is false, or if
+            ``snapshot_ids`` contains protected or unknown IDs, or if
+            ``retain_last < 1``.
+
+        Examples
+        --------
+        >>> table.expire_snapshots(retain_last=10)  # doctest: +SKIP
+        >>> from datetime import datetime, timedelta, timezone
+        >>> cutoff = datetime.now(tz=timezone.utc) - timedelta(days=7)
+        >>> table.expire_snapshots(older_than=cutoff)  # doctest: +SKIP
+        """
+        from daft.io.iceberg._expire import run as _expire_run
+
+        return _expire_run(
+            self._inner,
+            older_than=older_than,
+            retain_last=retain_last,
+            snapshot_ids=snapshot_ids,
+            clean_expired_files=clean_expired_files,
+            stream_results=stream_results,
             options=options,
         )
 
