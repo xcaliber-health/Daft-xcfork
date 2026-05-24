@@ -9,15 +9,14 @@ pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * MIB;
 pub const MIN_TARGET_FILE_SIZE_BYTES: u64 = MIB;
 pub const MAX_TARGET_FILE_SIZE_BYTES: u64 = 5 * GIB;
 pub const DEFAULT_MIN_INPUT_FILES: u32 = 5;
-pub const DEFAULT_MAX_GROUP_BYTES: u64 = 5 * GIB;
+pub const DEFAULT_MAX_GROUP_BYTES: u64 = 100 * GIB;
 pub const DEFAULT_DELETE_FILE_THRESHOLD: u32 = u32::MAX;
 pub const DEFAULT_MAX_COMMITS: u32 = 10;
 pub const DEFAULT_MAX_CONCURRENT: u32 = 5;
 pub const DEFAULT_ZORDER_VAR_LEN_CONTRIBUTION: u32 = 8;
-// Per-row interleaved key cap. Iceberg's `ZOrderByteUtils` interleaves a few bytes per
-// column (typically 8 for primitives + var-length for strings); 4096 is generous and keeps
-// allocation bounded — the buffer is reserved per row, so values matching `target-file-size`
-// would allocate gigabytes per group.
+// Per-row interleaved key cap. Primitive columns contribute 8 bytes each and
+// string columns contribute up to `var_length_contribution`; 4096 is generous
+// enough for ~hundreds of columns and keeps the per-row allocation bounded.
 pub const DEFAULT_ZORDER_MAX_OUTPUT_SIZE: u64 = 4096;
 pub const MAX_ZORDER_MAX_OUTPUT_SIZE: u64 = MIB;
 

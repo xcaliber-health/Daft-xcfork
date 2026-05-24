@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
-from daft.io.iceberg._compact import _remove_dangling_deletes
+from daft.io.iceberg._compact import _remove_dangling_deletes  # noqa: internal
 
 
 def test_remove_dangling_deletes_option_is_safe_noop(make_tiny_table):

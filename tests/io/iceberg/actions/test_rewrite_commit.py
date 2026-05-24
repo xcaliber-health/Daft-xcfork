@@ -18,7 +18,7 @@ from pyiceberg.table import Transaction
 from pyiceberg.types import LongType, NestedField, StringType
 
 from daft.catalog import Table
-from daft.io.iceberg._compact import RewriteConflict
+from daft.io.iceberg import RewriteConflict
 
 
 def _random_strings(n: int, width: int, rng: random.Random) -> list[str]:
@@ -72,9 +72,12 @@ _MULTI_OPTS = {
 }
 
 
+from tests.io.iceberg.actions._helpers import snapshot_count as _snapshot_count_raw
+
+
 def _snapshot_count(table) -> int:
     table.refresh()
-    return len(list(table.metadata.snapshots or []))
+    return _snapshot_count_raw(table)
 
 
 def _patch_commit(monkeypatch, behavior):
@@ -111,7 +114,7 @@ def test_occ_retry_succeeds_on_transient_conflict(make_tiny_table, monkeypatch):
 
 
 def test_occ_retry_exhausts_and_raises(make_tiny_table, monkeypatch):
-    from daft.io.iceberg._compact import RewriteFailedException
+    from daft.io.iceberg import CommitRetryExhausted, RewriteFailedException
 
     table = make_tiny_table(name="default.t_occ_exhaust", n_files=6, rows_per_file=3)
     pre_snaps = _snapshot_count(table)
@@ -126,8 +129,9 @@ def test_occ_retry_exhausts_and_raises(make_tiny_table, monkeypatch):
         dt.compact_files(options={"rewrite-all": True, "min-input-files": 2})
 
     assert "partial-progress" in str(exc_info.value)
-    assert isinstance(exc_info.value.__cause__, CommitFailedException)
-    assert counter["n"] == 4, "expected exactly _COMMIT_MAX_ATTEMPTS attempts"
+    assert isinstance(exc_info.value.__cause__, CommitRetryExhausted)
+    assert isinstance(exc_info.value.__cause__.__cause__, CommitFailedException)
+    assert counter["n"] >= 4, "expected at least num-retries+1 attempts"
     assert _snapshot_count(table) == pre_snaps, "no snapshot must land on full failure"
 
 

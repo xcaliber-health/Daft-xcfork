@@ -48,9 +48,11 @@ impl FileGroup {
 
 /// Group candidate files for rewrite.
 ///
-/// Steps: bucket by `(partition_key, partition_spec_id)`, drop files that don't need
-/// rewrite per Iceberg's heuristics, skip buckets below `min_input_files`, bin-pack into
-/// groups capped by `max_file_group_size_bytes`, then sort across buckets by `job_order`.
+/// Steps: bucket by `(partition_key, partition_spec_id)`, drop files that fall
+/// inside `[min_file_size_bytes, max_file_size_bytes]` and below
+/// `delete_file_threshold`, skip buckets below `min_input_files`, bin-pack into
+/// groups capped by `max_file_group_size_bytes`, then sort across buckets by
+/// `job_order`.
 pub fn plan_file_groups(
     candidates: Vec<CandidateFile>,
     opts: &RewriteOptions,

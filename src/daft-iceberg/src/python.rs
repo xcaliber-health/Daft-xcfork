@@ -10,6 +10,7 @@ use pyo3::{
 use crate::{
     errors::IcebergRewriteError,
     options::{JobOrder, RewriteOptions},
+    orphan::orphan_diff,
     planner::{CandidateFile, FileGroup, plan_file_groups},
     zorder::build_zorder_key_array,
 };
@@ -258,12 +259,23 @@ fn build_zorder_key_py<'py>(
     data.to_pyarrow(arrays.py())
 }
 
+/// Return paths in ``listed`` that are absent from ``reachable``.
+///
+/// Order matches ``listed``. Inputs are consumed (no extra clones on the
+/// Python boundary).
+#[pyfunction]
+#[pyo3(signature = (listed, reachable))]
+fn orphan_diff_py(listed: Vec<String>, reachable: Vec<String>) -> PyResult<Vec<String>> {
+    Ok(orphan_diff(listed, reachable))
+}
+
 pub fn register_modules(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "_iceberg")?;
     m.add_function(wrap_pyfunction!(plan_file_groups_py, &m)?)?;
     m.add_function(wrap_pyfunction!(validate_options_py, &m)?)?;
     m.add_function(wrap_pyfunction!(build_zorder_key_py, &m)?)?;
+    m.add_function(wrap_pyfunction!(orphan_diff_py, &m)?)?;
     m.add(
         "EqualityDeletesPresentError",
         py.get_type::<EqualityDeletesPresentError>(),

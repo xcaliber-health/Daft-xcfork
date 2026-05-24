@@ -4,10 +4,10 @@
 //!   1. `normalize_to_ordered_bytes` — encode each column's values as fixed-width byte
 //!      arrays whose lexicographic order matches the value's natural order.
 //!   2. `interleave_bits` — bit-interleave the per-column byte arrays into a single
-//!      binary key, then sort by that key to produce a z-order (Morton) curve.
+//!      binary key. Sorting rows by that key produces a Z-order (Morton) curve.
 //!
-//! Nulls normalize to an empty byte slice, which sorts before any concrete value
-//! (nulls-first semantics, matching Iceberg's `ZOrderByteUtils`).
+//! Nulls normalize to a zero-filled slice of the column's encoded width and sort
+//! before any concrete value (nulls-first semantics).
 
 use arrow::array::{
     Array, ArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
@@ -26,8 +26,10 @@ pub const ZORDER_KEY_COL: &str = "__daft_zorder_key__";
 
 /// Encode each row of `array` as an ordered byte slice. Returns one `Vec<u8>` per row.
 ///
-/// The per-type byte widths match Iceberg's `ZOrderByteUtils` so that values from
-/// different Daft installations interleave identically. Nulls produce an empty slice.
+/// Per-type widths: int8/uint8 = 1 byte, int16/uint16 = 2, int32/uint32/date32 = 4,
+/// int64/uint64/timestamp = 8, float32 = 4, float64 = 8, decimal128 = 16, boolean = 1,
+/// utf8/binary = `var_length_contribution` bytes (truncate-and-pad). Nulls produce a
+/// zero-filled slice of the column's width.
 pub fn normalize_to_ordered_bytes(
     array: &dyn Array,
     var_length_contribution: u32,
@@ -40,9 +42,9 @@ pub fn normalize_to_ordered_bytes(
         DataType::Boolean => fill(&mut out, array, n, |i, nulls| {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             if nulls.is_null(i) {
-                vec![]
+                vec![0u8; 1]
             } else if a.value(i) {
-                vec![0xFFu8]
+                vec![0x01u8]
             } else {
                 vec![0x00u8]
             }
@@ -58,7 +60,7 @@ pub fn normalize_to_ordered_bytes(
         DataType::Float32 => fill(&mut out, array, n, |i, nulls| {
             let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
             if nulls.is_null(i) {
-                vec![]
+                vec![0u8; 4]
             } else {
                 encode_float32(a.value(i)).to_vec()
             }
@@ -66,7 +68,7 @@ pub fn normalize_to_ordered_bytes(
         DataType::Float64 => fill(&mut out, array, n, |i, nulls| {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             if nulls.is_null(i) {
-                vec![]
+                vec![0u8; 8]
             } else {
                 encode_float64(a.value(i)).to_vec()
             }
@@ -81,7 +83,7 @@ pub fn normalize_to_ordered_bytes(
         DataType::Decimal128(_, _) => fill(&mut out, array, n, |i, nulls| {
             let a = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             if nulls.is_null(i) {
-                vec![]
+                vec![0u8; 16]
             } else {
                 let mut bytes = a.value(i).to_be_bytes();
                 bytes[0] ^= 0x80;
@@ -138,7 +140,7 @@ macro_rules! fill_int {
         let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
         for i in 0..$n {
             if a.is_null(i) {
-                $out.push(vec![]);
+                $out.push(vec![0u8; $width]);
             } else {
                 let v = a.value(i) as $prim_ty;
                 let mut bytes = v.to_be_bytes();
@@ -156,7 +158,7 @@ macro_rules! fill_uint {
         let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
         for i in 0..$n {
             if a.is_null(i) {
-                $out.push(vec![]);
+                $out.push(vec![0u8; $width]);
             } else {
                 let v = a.value(i) as $prim_ty;
                 $out.push(v.to_be_bytes().to_vec());
@@ -178,7 +180,7 @@ macro_rules! fill_var {
         let a = $array.as_any().downcast_ref::<$arr_ty>().unwrap();
         for i in 0..$n {
             if a.is_null(i) {
-                $out.push(vec![]);
+                $out.push(vec![0u8; $var_len]);
             } else {
                 let raw: &[u8] = $extract(a.value(i));
                 let mut buf = vec![0u8; $var_len];
@@ -216,8 +218,7 @@ fn encode_float64(v: f64) -> [u8; 8] {
 /// Interleave the bits of each row's per-column byte arrays into a single binary key.
 ///
 /// `columns[c][r]` is the normalized bytes for column `c` row `r`. Output has `n_rows`
-/// entries each of length `output_size`. Shorter columns are zero-padded; rows where
-/// every column is empty (all-null) produce an empty key.
+/// entries each of length `output_size`. Shorter columns are zero-padded.
 pub fn interleave_bits(columns: &[Vec<Vec<u8>>], output_size: u64) -> Vec<Vec<u8>> {
     if columns.is_empty() {
         return Vec::new();
@@ -230,11 +231,6 @@ pub fn interleave_bits(columns: &[Vec<Vec<u8>>], output_size: u64) -> Vec<Vec<u8
 
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
     for r in 0..n_rows {
-        let all_null = columns.iter().all(|c| c[r].is_empty());
-        if all_null {
-            out.push(Vec::new());
-            continue;
-        }
         let mut buf = vec![0u8; output_bytes];
         let mut out_bit = 0usize;
         let max_col_bits = columns
@@ -366,11 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn null_becomes_empty_bytes() {
+    fn null_becomes_zero_padded_bytes() {
         let arr = Int32Array::from(vec![Some(1), None, Some(2)]);
         let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
-        assert_eq!(bytes[1], Vec::<u8>::new());
-        assert!(!bytes[0].is_empty() && !bytes[2].is_empty());
+        assert_eq!(bytes[1], vec![0u8; 4]);
+        assert_eq!(bytes[0].len(), 4);
+        assert_eq!(bytes[2].len(), 4);
     }
 
     #[test]
@@ -379,7 +376,40 @@ mod tests {
         let bytes = normalize_to_ordered_bytes(&arr, 4).unwrap();
         assert_eq!(bytes[0], b"a\x00\x00\x00");
         assert_eq!(bytes[1], b"abcd");
-        assert_eq!(bytes[2], Vec::<u8>::new());
+        assert_eq!(bytes[2], vec![0u8; 4]);
+    }
+
+    #[test]
+    fn boolean_encoding_matches_canonical() {
+        let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
+        assert_eq!(bytes[0], vec![0x01u8]);
+        assert_eq!(bytes[1], vec![0x00u8]);
+        assert_eq!(bytes[2], vec![0x00u8]);
+    }
+
+    #[test]
+    fn decimal128_round_trip_preserves_sign_order() {
+        use arrow::array::Decimal128Array;
+        let arr = Decimal128Array::from(vec![Some(-100i128), Some(-1), Some(0), Some(1), Some(100), None])
+            .with_precision_and_scale(20, 4)
+            .unwrap();
+        let bytes = normalize_to_ordered_bytes(&arr, 8).unwrap();
+        for w in bytes[..5].windows(2) {
+            assert!(w[0] <= w[1], "decimal ordering broken: {:?} vs {:?}", w[0], w[1]);
+        }
+        assert_eq!(bytes[5], vec![0u8; 16]);
+    }
+
+    #[test]
+    fn partial_null_row_still_clusters_by_other_columns() {
+        let a = vec![vec![0x80u8, 0, 0, 0], vec![0u8; 4]];
+        let b = vec![vec![0x80u8, 0, 0, 0], vec![0x80u8, 0, 0, 0]];
+        let out = interleave_bits(&[a, b], 8);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len(), 8);
+        assert_eq!(out[1].len(), 8);
+        assert_ne!(out[0], out[1]);
     }
 
     #[test]
@@ -395,10 +425,10 @@ mod tests {
     }
 
     #[test]
-    fn interleave_all_null_yields_empty() {
-        let cols = vec![vec![Vec::<u8>::new()], vec![Vec::<u8>::new()]];
+    fn interleave_all_zero_inputs_yield_all_zero_key() {
+        let cols = vec![vec![vec![0u8; 4]], vec![vec![0u8; 4]]];
         let out = interleave_bits(&cols, 4);
-        assert_eq!(out[0], Vec::<u8>::new());
+        assert_eq!(out[0], vec![0u8; 4]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ pytest.importorskip("pyiceberg")
 from pyiceberg.exceptions import CommitFailedException
 
 from daft.catalog import Table
-from daft.io.iceberg._compact import RewriteFailedException
+from daft.io.iceberg import RewriteFailedException
 
 
 def _file_count(table) -> int:
@@ -121,8 +121,8 @@ def test_failed_data_files_counted_in_result(local_catalog, monkeypatch):
 
     def selective_fail(self):
         state["calls"] += 1
-        # Fail the first batch entirely (4 attempts), allow the second through.
-        if state["calls"] <= 4:
+        # Fail the first batch entirely (num-retries+1 = 5 attempts), allow the second through.
+        if state["calls"] <= 5:
             raise CommitFailedException("forced first-batch fail")
         return real_commit_transaction(self)
 

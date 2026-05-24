@@ -8,13 +8,10 @@ pytest.importorskip("pyiceberg")
 
 from daft.catalog import Table
 
-
-def _scan_file_count(table) -> int:
-    return len(list(table.scan().plan_files()))
-
-
-def _read_ids(table) -> list[int]:
-    return sorted(int(r["id"]) for r in table.scan().to_arrow().to_pylist())
+from tests.io.iceberg.actions._helpers import (
+    read_ids as _read_ids,
+    scan_file_count as _scan_file_count,
+)
 
 
 def test_binpack_reduces_file_count(make_tiny_table):
@@ -75,5 +72,9 @@ def test_binpack_idempotent_replay(make_tiny_table):
         options={"rewrite-all": True, "min-input-files": 2, "rewrite-id": rid}
     )
     assert r1.rewrite_id == rid == r2.rewrite_id
-    # Second call must not create another commit beyond the recorded one.
     assert r2.commits == r1.commits
+    assert r2.rewritten_files == r1.rewritten_files
+    assert r2.added_files == r1.added_files
+    assert r2.bytes_rewritten == r1.bytes_rewritten
+    assert r2.bytes_added == r1.bytes_added
+    assert r2.snapshot_ids == r1.snapshot_ids

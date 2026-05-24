@@ -6,6 +6,7 @@
 
 pub mod errors;
 pub mod options;
+pub mod orphan;
 pub mod planner;
 pub mod zorder;
 
@@ -16,6 +17,7 @@ pub use errors::IcebergRewriteError;
 pub use options::{
     JobOrder, NullOrder, RewriteOptions, SortColumn, SortDirection, Strategy, ZOrderKey,
 };
+pub use orphan::orphan_diff;
 pub use planner::{CandidateFile, FileGroup, plan_file_groups};
 pub use zorder::{ZORDER_KEY_COL, build_zorder_key_array, interleave_bits, normalize_to_ordered_bytes};
 

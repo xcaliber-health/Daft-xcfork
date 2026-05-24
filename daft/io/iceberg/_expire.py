@@ -1,4 +1,4 @@
-"""expire_snapshots orchestration: snapshot-set resolution, metadata commit, file cleanup."""
+"""Expire snapshots: resolve the kept set, commit the metadata change, delete unreachable files."""
 
 from __future__ import annotations
 
@@ -9,6 +9,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
+from daft.io.iceberg._common import (
+    DEFAULT_DELETE_BACKOFF_BASE_SECONDS,
+    DEFAULT_DELETE_NUM_RETRIES,
+    DEFAULT_MAX_CONCURRENT_DELETES,
+    DEFAULT_MAX_CONCURRENT_MANIFEST_READS,
+    CommitRetryExhausted,
+    commit_with_retry,
+    delete_files,
+    is_not_found,
+    validate_gc_enabled,
+)
+
 if TYPE_CHECKING:
     from pyiceberg.manifest import ManifestFile
     from pyiceberg.table import Table as PyIcebergTable
@@ -16,19 +28,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-GC_ENABLED_KEY = "gc.enabled"
 MAX_SNAPSHOT_AGE_MS_KEY = "history.expire.max-snapshot-age-ms"
 MIN_SNAPSHOTS_TO_KEEP_KEY = "history.expire.min-snapshots-to-keep"
 
-_DEFAULT_MAX_SNAPSHOT_AGE_MS = 5 * 24 * 60 * 60 * 1000  # 5 days
+_DEFAULT_MAX_SNAPSHOT_AGE_MS = 5 * 24 * 60 * 60 * 1000
 _DEFAULT_MIN_SNAPSHOTS_TO_KEEP = 1
-
-_DEFAULT_MAX_CONCURRENT_DELETES = 4
-_DEFAULT_MAX_CONCURRENT_MANIFEST_READS = 4
-_DEFAULT_DELETE_NUM_RETRIES = 3
-_DEFAULT_DELETE_BACKOFF_BASE_SECONDS = 0.1
-_COMMIT_MAX_ATTEMPTS = 4
-_COMMIT_BACKOFF_BASE_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,7 @@ class ExpireResult:
 
 
 class ExpireSnapshotsFailedException(RuntimeError):
-    """Expire snapshots could not commit or could not make forward progress."""
+    """Raised when expire_snapshots cannot commit or make forward progress."""
 
 
 def run(
@@ -75,25 +79,23 @@ def run(
 ) -> ExpireResult:
     opts = options or {}
     max_concurrent_deletes = int(
-        opts.get("max-concurrent-deletes", _DEFAULT_MAX_CONCURRENT_DELETES)
+        opts.get("max-concurrent-deletes", DEFAULT_MAX_CONCURRENT_DELETES)
     )
     max_concurrent_manifest_reads = int(
         opts.get(
-            "max-concurrent-manifest-reads", _DEFAULT_MAX_CONCURRENT_MANIFEST_READS
+            "max-concurrent-manifest-reads", DEFAULT_MAX_CONCURRENT_MANIFEST_READS
         )
     )
     delete_num_retries = int(
-        opts.get("delete-num-retries", _DEFAULT_DELETE_NUM_RETRIES)
+        opts.get("delete-num-retries", DEFAULT_DELETE_NUM_RETRIES)
     )
     delete_backoff_base = float(
-        opts.get("delete-backoff-base-seconds", _DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
+        opts.get("delete-backoff-base-seconds", DEFAULT_DELETE_BACKOFF_BASE_SECONDS)
     )
 
-    _validate_gc_enabled(table)
+    validate_gc_enabled(table)
 
     if older_than is None and retain_last is None and not snapshot_ids:
-        # Fall back to table property defaults so callers get sensible behavior
-        # from a bare expire_snapshots() invocation.
         max_age_ms = int(
             table.properties.get(MAX_SNAPSHOT_AGE_MS_KEY, _DEFAULT_MAX_SNAPSHOT_AGE_MS)
         )
@@ -168,22 +170,22 @@ def run(
         )
         to_delete = [(p, k) for p, k in candidate_paths.items() if p not in kept_paths]
 
-    return _delete_files(
+    counts, _failed = delete_files(
         table=table,
         to_delete=to_delete,
         max_concurrent_deletes=max_concurrent_deletes,
         num_retries=delete_num_retries,
         backoff_base=delete_backoff_base,
+        op_name="expire_snapshots",
     )
-
-
-def _validate_gc_enabled(table: PyIcebergTable) -> None:
-    raw = table.properties.get(GC_ENABLED_KEY, "true")
-    if str(raw).strip().lower() in {"false", "0", "no"}:
-        raise ValueError(
-            f"expire_snapshots refuses to run: table property {GC_ENABLED_KEY}=false. "
-            "Set it to true to permit physical file deletion."
-        )
+    return ExpireResult(
+        deleted_data_files_count=counts.get(_KIND_DATA, 0),
+        deleted_position_delete_files_count=counts.get(_KIND_POS_DELETE, 0),
+        deleted_equality_delete_files_count=counts.get(_KIND_EQ_DELETE, 0),
+        deleted_manifest_files_count=counts.get(_KIND_MANIFEST, 0),
+        deleted_manifest_lists_count=counts.get(_KIND_MANIFEST_LIST, 0),
+        deleted_statistics_files_count=counts.get(_KIND_STATS, 0),
+    )
 
 
 def _protected_snapshot_ids(table: PyIcebergTable) -> set[int]:
@@ -244,8 +246,6 @@ def _resolve_expired_ids(
             if s.snapshot_id not in kept:
                 candidates.add(s.snapshot_id)
     else:
-        # Even without explicit retain_last, the min-snapshots floor still applies as a guard
-        # so we never strand the table below the configured minimum.
         min_keep = int(
             table.properties.get(
                 MIN_SNAPSHOTS_TO_KEEP_KEY, _DEFAULT_MIN_SNAPSHOTS_TO_KEEP
@@ -283,34 +283,36 @@ def _to_epoch_millis(value: _dt.datetime | int) -> int:
 
 
 def _commit_expire(table: PyIcebergTable, expired_ids: set[int]) -> None:
-    """Atomic metadata commit with bounded retry on CAS conflict."""
-    from pyiceberg.exceptions import CommitFailedException
+    """Commit the snapshot-expiry metadata change with bounded OCC retry."""
+    state = {"ids": sorted(expired_ids)}
+    sentinel = object()
 
-    last_err: Exception | None = None
-    ids = sorted(expired_ids)
-    for attempt in range(_COMMIT_MAX_ATTEMPTS):
-        try:
-            table.maintenance.expire_snapshots().by_ids(ids).commit()
-            return
-        except CommitFailedException as e:
-            last_err = e
-            if attempt < _COMMIT_MAX_ATTEMPTS - 1:
-                time.sleep(_COMMIT_BACKOFF_BASE_SECONDS * (2**attempt))
-                table.refresh()
-                # Re-validate that the targeted IDs still exist and aren't protected after refresh.
-                known = {s.snapshot_id for s in table.metadata.snapshots}
-                protected = _protected_snapshot_ids(table)
-                ids = [sid for sid in ids if sid in known and sid not in protected]
-                if not ids:
-                    return
-                continue
-    assert last_err is not None
-    raise ExpireSnapshotsFailedException(
-        f"expire_snapshots: metadata commit failed after {_COMMIT_MAX_ATTEMPTS} attempts"
-    ) from last_err
+    def _attempt(_: int) -> object:
+        if not state["ids"]:
+            return sentinel
+        table.maintenance.expire_snapshots().by_ids(state["ids"]).commit()
+        return sentinel
 
+    def _on_conflict(t: PyIcebergTable) -> object | None:
+        known = {s.snapshot_id for s in t.metadata.snapshots}
+        protected = _protected_snapshot_ids(t)
+        state["ids"] = [sid for sid in state["ids"] if sid in known and sid not in protected]
+        if not state["ids"]:
+            return sentinel
+        return None
 
-# ---------- reachability ----------
+    try:
+        commit_with_retry(
+            table,
+            _attempt,
+            op_name="expire_snapshots",
+            on_conflict=_on_conflict,
+        )
+    except CommitRetryExhausted as exc:
+        raise ExpireSnapshotsFailedException(
+            "expire_snapshots: metadata commit could not land within the retry budget"
+        ) from exc
+
 
 _KIND_DATA = "data"
 _KIND_POS_DELETE = "pos_delete"
@@ -328,7 +330,7 @@ def _collect_paths(
     partition_statistics_files: Iterable[Any],
     max_concurrent_manifest_reads: int,
 ) -> tuple[dict[str, str], int]:
-    """Return ``{path -> kind}`` for every file reachable from ``snapshots`` plus statistics."""
+    """Return ``{path: kind}`` for every file reachable from ``snapshots`` and statistics."""
     paths: dict[str, str] = {}
     manifest_files: list[Any] = []
 
@@ -340,9 +342,14 @@ def _collect_paths(
             for m in snap.manifests(table.io):
                 manifest_files.append(m)
                 paths.setdefault(m.manifest_path, _KIND_MANIFEST)
-        except FileNotFoundError:
-            # A prior expire may already have removed a manifest list; skip.
-            continue
+        except Exception as exc:
+            if not is_not_found(exc):
+                raise
+            logger.warning(
+                "expire_snapshots: manifest list missing for snapshot %s (%s); skipping",
+                getattr(snap, "snapshot_id", "?"),
+                ml,
+            )
 
     for entry_path, kind in _read_manifest_entries(
         table=table,
@@ -365,13 +372,21 @@ def _read_manifest_entries(
     manifests: list[ManifestFile],
     max_workers: int,
 ) -> Iterator[tuple[str, str]]:
-    """Yield (path, kind) for every data/delete file across a list of manifests."""
+    """Yield ``(path, kind)`` for every live data/delete file across ``manifests``."""
     from pyiceberg.manifest import DataFileContent
 
     def _read_one(m: ManifestFile) -> list[tuple[str, str]]:
+        # discard_deleted=True so DELETED entries in a kept snapshot's manifest
+        # do not pin retired data files into kept_paths.
         try:
-            entries = m.fetch_manifest_entry(table.io, discard_deleted=False)
-        except FileNotFoundError:
+            entries = m.fetch_manifest_entry(table.io, discard_deleted=True)
+        except Exception as exc:
+            if not is_not_found(exc):
+                raise
+            logger.warning(
+                "expire_snapshots: manifest missing on object store: %s; skipping",
+                m.manifest_path,
+            )
             return []
         out: list[tuple[str, str]] = []
         for e in entries:
@@ -409,14 +424,21 @@ def _stream_candidate_paths(
     expired_ids: set[int],
     max_concurrent_manifest_reads: int,
 ) -> Iterator[tuple[str, str]]:
-    """Stream candidate paths snapshot-by-snapshot for memory-bounded expiration."""
+    """Yield candidate paths snapshot-by-snapshot for memory-bounded expiration."""
     for snap in snapshots:
         ml = getattr(snap, "manifest_list", None)
         if ml:
             yield ml, _KIND_MANIFEST_LIST
         try:
             ms = list(snap.manifests(table.io))
-        except FileNotFoundError:
+        except Exception as exc:
+            if not is_not_found(exc):
+                raise
+            logger.warning(
+                "expire_snapshots: manifest list missing for snapshot %s (%s); skipping",
+                getattr(snap, "snapshot_id", "?"),
+                ml,
+            )
             continue
         for m in ms:
             yield m.manifest_path, _KIND_MANIFEST
@@ -430,92 +452,3 @@ def _stream_candidate_paths(
     for s in partition_statistics_files:
         if s.snapshot_id in expired_ids:
             yield s.statistics_path, _KIND_STATS
-
-
-# ---------- delete loop ----------
-
-
-_DELETE_CHUNK_SIZE = 256
-
-
-def _delete_files(
-    *,
-    table: PyIcebergTable,
-    to_delete: Iterable[tuple[str, str]],
-    max_concurrent_deletes: int,
-    num_retries: int,
-    backoff_base: float,
-) -> ExpireResult:
-    """Delete files in chunked parallel batches.
-
-    Accepts any iterable. Materializes only one chunk at a time, so streaming
-    callers (`stream_results=True`) stay memory-bounded at ``_DELETE_CHUNK_SIZE``.
-    """
-    counts = {
-        _KIND_DATA: 0,
-        _KIND_POS_DELETE: 0,
-        _KIND_EQ_DELETE: 0,
-        _KIND_MANIFEST: 0,
-        _KIND_MANIFEST_LIST: 0,
-        _KIND_STATS: 0,
-    }
-    io = table.io
-
-    def _delete_one(item: tuple[str, str]) -> tuple[str, str, bool]:
-        path, kind = item
-        for attempt in range(num_retries + 1):
-            try:
-                io.delete(path)
-                return path, kind, True
-            except FileNotFoundError:
-                return path, kind, True
-            except Exception as exc:
-                if _is_not_found(exc):
-                    return path, kind, True
-                if attempt < num_retries:
-                    time.sleep(backoff_base * (2**attempt))
-                    continue
-                logger.warning("expire_snapshots: failed to delete %s: %r", path, exc)
-                return path, kind, False
-        return path, kind, False
-
-    workers = max(1, max_concurrent_deletes)
-    iterator = iter(to_delete)
-
-    if workers == 1:
-        for item in iterator:
-            _, kind, ok = _delete_one(item)
-            if ok:
-                counts[kind] += 1
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            while True:
-                chunk: list[tuple[str, str]] = []
-                for _ in range(_DELETE_CHUNK_SIZE):
-                    try:
-                        chunk.append(next(iterator))
-                    except StopIteration:
-                        break
-                if not chunk:
-                    break
-                for _, kind, ok in pool.map(_delete_one, chunk):
-                    if ok:
-                        counts[kind] += 1
-
-    return ExpireResult(
-        deleted_data_files_count=counts[_KIND_DATA],
-        deleted_position_delete_files_count=counts[_KIND_POS_DELETE],
-        deleted_equality_delete_files_count=counts[_KIND_EQ_DELETE],
-        deleted_manifest_files_count=counts[_KIND_MANIFEST],
-        deleted_manifest_lists_count=counts[_KIND_MANIFEST_LIST],
-        deleted_statistics_files_count=counts[_KIND_STATS],
-    )
-
-
-def _is_not_found(exc: BaseException) -> bool:
-    """True for object-store NotFound errors that should be treated as success."""
-    name = type(exc).__name__
-    if name in {"FileNotFoundError", "NoSuchKey", "ObjectNotFound", "BlobNotFound"}:
-        return True
-    msg = str(exc).lower()
-    return "not found" in msg or "no such key" in msg or "404" in msg

@@ -314,22 +314,61 @@ class IcebergTable(Table):
         branch: str | None = None,
         options: dict[str, Any] | None = None,
     ) -> Any:
-        """Compact or re-cluster data files in this table.
+        """Compact or re-cluster the data files of this table.
 
-        `strategy` is one of:
-            - ``"binpack"``: consolidate small/skewed files into target-sized files.
-            - ``"sort"``: sort by ``sort_order`` (list of ``(column, asc|desc, nulls-first|nulls-last)``).
-            - ``"zorder"``: spatially cluster on ``zorder_by`` columns via z-order curve.
+        Reads matching data files, writes new files sized close to
+        ``target-file-size-bytes``, and commits an atomic snapshot that
+        replaces the inputs with the outputs. Tolerates concurrent appends to
+        partitions outside the rewrite scope; raises ``RewriteConflict`` when
+        another writer modifies an affected partition between plan and commit.
 
-        `where` filters candidate files via pyiceberg's expression language. `branch`
-        targets a non-default branch. `options` is a dict of tuning knobs; see the
-        docs for the full table.
+        Parameters
+        ----------
+        strategy : {"binpack", "sort", "zorder"}, default ``"binpack"``
+            ``"binpack"`` packs small files into larger ones without ordering.
+            ``"sort"`` sorts each output by ``sort_order``. ``"zorder"`` clusters
+            each output along an interleaved-bits curve over ``zorder_by``.
+        sort_order : list of (str, str, str), optional
+            Required when ``strategy="sort"``. Each entry is
+            ``(column, "asc"|"desc", "nulls-first"|"nulls-last")``.
+        zorder_by : list of str, optional
+            Required when ``strategy="zorder"``. Primitive numeric, boolean,
+            string, binary, date, time, timestamp, or decimal columns.
+        where : str or expression, optional
+            Filter narrowing the candidate files. Files outside the predicate
+            are not touched.
+        branch : str, optional
+            Branch to commit to. Defaults to ``main``.
+        options : dict, optional
+            Tuning knobs: ``target-file-size-bytes``, ``min-input-files``,
+            ``min-file-size-bytes``, ``max-file-size-bytes``,
+            ``max-file-group-size-bytes``, ``rewrite-all``,
+            ``rewrite-job-order``, ``max-concurrent-file-group-rewrites``,
+            ``delete-file-threshold``, ``partial-progress.enabled``,
+            ``partial-progress.max-commits``,
+            ``partial-progress.max-failed-commits``, ``compression-factor``,
+            ``remove-dangling-deletes``, ``zorder.max-output-size``,
+            ``zorder.var-length-contribution``. Commit retry is tuned via
+            table properties ``commit.retry.num-retries``,
+            ``commit.retry.min-wait-ms``, ``commit.retry.max-wait-ms``,
+            ``commit.retry.total-timeout-ms``.
 
-        Returns a ``RewriteResult`` summarizing files removed, files added, and the
-        commit's ``rewrite_id`` (used for idempotent replay).
+        Returns
+        -------
+        RewriteResult
+            File and byte counts, commit count, snapshot ids, and a stable
+            ``rewrite_id`` used for idempotent replay.
 
-        Equality deletes anywhere in the scanned scope raise
-        ``daft.daft.EqualityDeletesPresentError`` — apply them first.
+        Raises
+        ------
+        ValueError
+            On unknown ``strategy`` or invalid ``sort_order`` / ``zorder_by``.
+        EqualityDeletesPresentError
+            When the scanned scope contains equality-delete files; apply them
+            before retrying.
+        RewriteConflict
+            When a concurrent writer modified a partition this call is
+            rewriting, or removed one of its input files.
 
         Examples
         --------
@@ -398,6 +437,10 @@ class IcebergTable(Table):
             - ``delete-num-retries`` (int, default 3)
             - ``delete-backoff-base-seconds`` (float, default 0.1)
 
+            Commit retry is tuned via table properties
+            ``commit.retry.num-retries``, ``commit.retry.min-wait-ms``,
+            ``commit.retry.max-wait-ms``, ``commit.retry.total-timeout-ms``.
+
         Returns
         -------
         ExpireResult
@@ -426,6 +469,158 @@ class IcebergTable(Table):
             snapshot_ids=snapshot_ids,
             clean_expired_files=clean_expired_files,
             stream_results=stream_results,
+            options=options,
+        )
+
+    def remove_orphan_files(
+        self,
+        *,
+        older_than: Any | None = None,
+        location: str | None = None,
+        dry_run: bool = False,
+        prefix_mismatch_mode: str = "error",
+        stream_results: bool = False,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Delete files under the table location that no snapshot references.
+
+        Lists physical files under ``location`` (defaulting to ``table.location()``),
+        subtracts the union of files reachable from every snapshot (data, delete,
+        manifest, manifest-list, statistics, metadata.json), and deletes the rest.
+
+        Parameters
+        ----------
+        older_than : datetime.datetime or int, optional
+            Cutoff: only files modified strictly before this point are considered.
+            ``int`` is treated as epoch milliseconds. Defaults to 3 days ago.
+            Cutoffs newer than 24 hours ago are rejected to avoid racing live
+            writers (override only in tests with ``options={'allow-recent': True}``).
+        location : str, optional
+            Subpath of ``table.location()`` to limit listing to. Useful for
+            incremental cleanup. Defaults to the full table location.
+        dry_run : bool, default False
+            When ``True``, identify orphans without deleting. ``deleted_files_count``
+            is ``0`` and ``sample_paths`` contains a sample of what would be deleted.
+        prefix_mismatch_mode : str, default ``"error"``
+            How to treat listed files whose scheme/authority is absent from the
+            reachable set. ``"error"`` raises (default; safest), ``"delete"``
+            treats them as orphans, ``"ignore"`` drops them from consideration.
+            Scheme aliases (``s3``/``s3a``/``s3n``) are canonicalized before this
+            check.
+        stream_results : bool, default False
+            Stream the listing through the reachability filter rather than
+            materializing it. Bounds memory at the per-subdir listing size; the
+            reachable set is always in memory.
+        options : dict, optional
+            Tuning knobs:
+
+            - ``max-concurrent-list`` (int, default 4)
+            - ``max-concurrent-deletes`` (int, default 4)
+            - ``delete-num-retries`` (int, default 3)
+            - ``delete-backoff-base-seconds`` (float, default 0.1)
+            - ``sample-limit`` (int, default 1000) — cap on ``sample_paths``.
+            - ``allow-recent`` (bool, default False) — disables the 24-hour
+              floor; for tests only.
+
+        Returns
+        -------
+        RemoveOrphanResult
+            Counts and a bounded sample of orphan paths.
+
+        Raises
+        ------
+        ValueError
+            If the table property ``gc.enabled`` is false, if ``older_than`` is
+            within 24 hours of now (and ``allow-recent`` is not set), if
+            ``prefix_mismatch_mode`` is not one of the three allowed values, or
+            if ``location`` is not a subpath of ``table.location()``.
+        PrefixMismatchError
+            With ``prefix_mismatch_mode='error'``, when any listed file uses a
+            scheme/authority absent from the reachable set.
+
+        Examples
+        --------
+        >>> table.remove_orphan_files(dry_run=True)  # doctest: +SKIP
+        >>> from datetime import datetime, timedelta, timezone
+        >>> cutoff = datetime.now(tz=timezone.utc) - timedelta(days=7)
+        >>> table.remove_orphan_files(older_than=cutoff)  # doctest: +SKIP
+        """
+        from daft.io.iceberg._remove_orphan import run as _remove_orphan_run
+
+        return _remove_orphan_run(
+            self._inner,
+            older_than=older_than,
+            location=location,
+            dry_run=dry_run,
+            prefix_mismatch_mode=prefix_mismatch_mode,
+            stream_results=stream_results,
+            options=options,
+        )
+
+    def rewrite_manifests(
+        self,
+        *,
+        spec_id: int | None = None,
+        branch: str | None = None,
+        use_caching: bool = False,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Repack live manifest entries into target-sized manifests.
+
+        Reads the manifests of the target branch's current snapshot, keeps
+        only live entries, and writes a fresh manifest set sized to
+        ``manifest-target-size-bytes``. Output entries cluster by partition
+        so a partition-scoped query reads at most one manifest per partition.
+        Commits a single REPLACE snapshot in place of the rewritten manifests;
+        data and delete files are unchanged.
+
+        Parameters
+        ----------
+        spec_id : int, optional
+            Partition spec to rewrite. Defaults to the table's current spec.
+            Only manifests stamped with this spec are touched; manifests for
+            other specs pass through unchanged.
+        branch : str, optional
+            Branch to rewrite. Defaults to ``main``.
+        use_caching : bool, default False
+            Reserved for signature stability; ignored — manifests are read
+            from object storage on demand.
+        options : dict, optional
+            Tuning knobs (fall back to table properties where noted):
+
+            - ``manifest-target-size-bytes`` (int, default 8 MiB, falls back
+              to ``commit.manifest.target-size-bytes``)
+            - ``manifest-min-count-to-merge`` (int, default 100, falls back to
+              ``commit.manifest.min-count-to-merge``)
+
+            Commit retry is tuned via table properties
+            ``commit.retry.num-retries``, ``commit.retry.min-wait-ms``,
+            ``commit.retry.max-wait-ms``, ``commit.retry.total-timeout-ms``.
+
+        Returns
+        -------
+        RewriteManifestsResult
+            Counts and byte totals for the rewritten and added manifests, plus
+            the new snapshot id (``None`` when nothing needed rewriting).
+
+        Raises
+        ------
+        ValueError
+            If the table property ``gc.enabled`` is false, ``spec_id`` is not a
+            valid spec on the table, or ``branch`` does not exist (or is a tag).
+
+        Examples
+        --------
+        >>> table.rewrite_manifests()  # doctest: +SKIP
+        >>> table.rewrite_manifests(spec_id=0)  # doctest: +SKIP
+        """
+        from daft.io.iceberg._rewrite_manifests import run as _rewrite_manifests_run
+
+        return _rewrite_manifests_run(
+            self._inner,
+            spec_id=spec_id,
+            branch=branch,
+            use_caching=use_caching,
             options=options,
         )
 

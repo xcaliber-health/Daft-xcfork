@@ -14,23 +14,18 @@ pytest.importorskip("pyiceberg")
 from pyiceberg.exceptions import CommitFailedException
 
 from daft.catalog import Table
-from daft.io.iceberg._expire import ExpireResult, _resolve_expired_ids
+from daft.io.iceberg import ExpireResult
+from daft.io.iceberg._expire import _resolve_expired_ids  # noqa: internal
 
-
-def _snapshot_count(table) -> int:
-    return len(table.metadata.snapshots)
+from tests.io.iceberg.actions._helpers import (
+    scan_paths as _data_file_paths,
+    snapshot_count as _snapshot_count,
+    strip_scheme as _strip_scheme,
+)
 
 
 def _snapshot_ids(table) -> list[int]:
     return [s.snapshot_id for s in table.metadata.snapshots]
-
-
-def _data_file_paths(table) -> set[str]:
-    return {t.file.file_path for t in table.scan().plan_files()}
-
-
-def _strip_scheme(p: str) -> str:
-    return p[len("file://") :] if p.startswith("file://") else p
 
 
 def _all_files_exist(paths) -> bool:
@@ -290,6 +285,60 @@ def test_notfound_during_delete_is_success(make_tiny_table, monkeypatch):
         + result.deleted_manifest_lists_count
     )
     assert total >= 1
+
+
+def test_manifest_read_tolerates_aws_resource_not_found(
+    make_tiny_table, monkeypatch
+):
+    from pyiceberg.manifest import ManifestFile
+
+    table = make_tiny_table(name="default.t_exp_s3_nf", n_files=4, rows_per_file=3)
+    real_fetch = ManifestFile.fetch_manifest_entry
+    state = {"raised": False}
+
+    def flaky_fetch(self, io, discard_deleted=False):
+        if not state["raised"]:
+            state["raised"] = True
+            raise OSError(
+                f"AWS Error RESOURCE_NOT_FOUND during GetObject operation: "
+                f"No response body. (key: {self.manifest_path})"
+            )
+        return real_fetch(self, io, discard_deleted=discard_deleted)
+
+    monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", flaky_fetch)
+
+    dt_table = Table.from_iceberg(table)
+    result = dt_table.expire_snapshots(retain_last=1)
+    assert state["raised"]
+    assert isinstance(result, ExpireResult)
+
+
+def test_collect_paths_tolerates_aws_resource_not_found_on_manifests_list(
+    make_tiny_table, monkeypatch
+):
+    from pyiceberg.table.snapshots import Snapshot
+
+    table = make_tiny_table(
+        name="default.t_exp_s3_nf_ml", n_files=4, rows_per_file=3
+    )
+    real_manifests = Snapshot.manifests
+    state = {"raised": False}
+
+    def flaky_manifests(self, io):
+        if not state["raised"]:
+            state["raised"] = True
+            raise OSError(
+                "AWS Error RESOURCE_NOT_FOUND during GetObject operation: "
+                "manifest list gone"
+            )
+        return real_manifests(self, io)
+
+    monkeypatch.setattr(Snapshot, "manifests", flaky_manifests)
+
+    dt_table = Table.from_iceberg(table)
+    result = dt_table.expire_snapshots(retain_last=1)
+    assert state["raised"]
+    assert isinstance(result, ExpireResult)
 
 
 def test_commit_conflict_retries(make_tiny_table, monkeypatch):
