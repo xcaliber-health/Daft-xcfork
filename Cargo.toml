@@ -40,6 +40,7 @@ daft-functions-utf8 = {path = "src/daft-functions-utf8", default-features = fals
 daft-geo = {path = "src/daft-geo", default-features = false}
 daft-hash = {path = "src/daft-hash", default-features = false}
 daft-image = {path = "src/daft-image", default-features = false}
+daft-iceberg = {path = "src/daft-iceberg", default-features = false}
 daft-io = {path = "src/daft-io", default-features = false}
 daft-json = {path = "src/daft-json", default-features = false}
 daft-local-execution = {path = "src/daft-local-execution", default-features = false}
@@ -94,6 +95,7 @@ python = [
   "daft-functions-list/python",
   "daft-functions-utf8/python",
   "daft-functions/python",
+  "daft-iceberg/python",
   "daft-image/python",
   "daft-io/python",
   "daft-json/python",
@@ -215,6 +217,7 @@ members = [
   "src/daft-functions-utf8",
   "src/daft-functions-temporal",
   "src/daft-hash",
+  "src/daft-iceberg",
   "src/daft-image",
   "src/daft-io",
   "src/daft-json",
