@@ -6,9 +6,6 @@ one of {literals}":
 
   * ``EqualTo(col, lit)`` — must equal exactly one literal.
   * ``In(col, {lit, lit, ...})`` — must equal one of the listed literals.
-  * Conjunction (``And``) of either of the above — every conjunct must
-    hold; if ANY conjunct's literal set is provably absent from the row
-    group, the entire conjunction is false.
 
 Anything else (``Or``, ``Not``, ``NotEqualTo``, ranges) is treated as
 inconclusive: the row group survives.
@@ -54,37 +51,25 @@ PT_FIXED_LEN_BYTE_ARRAY = 7
 
 @dataclass(frozen=True)
 class BloomProbe:
-    """One column's equality-set extracted from a conjunct.
-
-    ``literals`` is non-empty. To prune the row group, every entry in
-    ``literals`` must report absent from the bloom filter.
-    """
     column: str
     type_id: int
     literals: tuple[bytes, ...]
-
 
 def extract_probes(
     expr: "BooleanExpression",
     schema: "IcebergSchema",
 ) -> list[BloomProbe]:
     """Return the list of bloom-probable conjuncts inside `expr`.
-
     Returns an empty list when no probable shape is present. Callers should
     skip bloom pruning when the list is empty.
     """
-    from pyiceberg.expressions import And
-
     conjuncts = list(_split_and(expr))
     probes: list[BloomProbe] = []
     for c in conjuncts:
         p = _conjunct_to_probe(c, schema)
         if p is not None:
             probes.append(p)
-    # Suppress unused import warning: And is referenced via _split_and.
-    _ = And
     return probes
-
 
 def _split_and(expr: "BooleanExpression") -> Iterable["BooleanExpression"]:
     """Flatten left/right children of nested ``And`` nodes."""
@@ -105,7 +90,6 @@ def _conjunct_to_probe(
     schema: "IcebergSchema",
 ) -> BloomProbe | None:
     """Try to extract a (column, literals, type_id) probe from one conjunct.
-
     Returns ``None`` for any shape we do not know how to prove false via a
     bloom filter.
     """
@@ -155,7 +139,6 @@ def _conjunct_to_probe(
 
 def _term_name(term) -> str | None:
     """Pull the column name out of a pyiceberg term.
-
     Handles both ``Reference("col")`` (unbound) and ``BoundReference`` (bound)
     shapes by looking for a ``name`` attribute first, then falling back to
     the bound-form's accessor field. Nested paths (struct subfields) are
@@ -173,7 +156,6 @@ def _term_name(term) -> str | None:
 
 
 def _literal_value(lit):
-    """Extract the python value out of a pyiceberg ``Literal``-like object."""
     if lit is None:
         return None
     return getattr(lit, "value", lit)
