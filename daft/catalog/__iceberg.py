@@ -322,6 +322,14 @@ class IcebergTable(Table):
         partitions outside the rewrite scope; raises ``RewriteConflict`` when
         another writer modifies an affected partition between plan and commit.
 
+        The commit-time conflict check defaults to serializable isolation, which
+        rejects the commit if any concurrent writer added a file to a partition
+        being rewritten. Set ``options={"conflict-isolation": "snapshot"}`` to
+        permit concurrent appends of new files into the same partition, rejecting
+        only when one of this call's own input files was removed. Snapshot
+        isolation is safe only when no concurrent process deletes data from the
+        touched partitions, such as an append-only writer.
+
         Parameters
         ----------
         strategy : {"binpack", "sort", "zorder"}, default ``"binpack"``
@@ -348,7 +356,9 @@ class IcebergTable(Table):
             ``partial-progress.max-commits``,
             ``partial-progress.max-failed-commits``, ``compression-factor``,
             ``remove-dangling-deletes``, ``zorder.max-output-size``,
-            ``zorder.var-length-contribution``. Commit retry is tuned via
+            ``zorder.var-length-contribution``,
+            ``conflict-isolation`` (``"serializable"`` default or ``"snapshot"``).
+            Commit retry is tuned via
             table properties ``commit.retry.num-retries``,
             ``commit.retry.min-wait-ms``, ``commit.retry.max-wait-ms``,
             ``commit.retry.total-timeout-ms``.

@@ -41,6 +41,22 @@ SNAPSHOT_PROP_MAINTENANCE_OP_VALUE = "rewrite-data-files"
 
 WRITE_TARGET_FILE_SIZE_BYTES_KEY = "write.target-file-size-bytes"
 
+# Conflict-isolation level for the commit-time overlap check.
+#
+# ``serializable`` (default) rejects the commit if any foreign snapshot added a
+# data file in a partition the rewrite touches since the plan was taken.
+# ``snapshot`` only rejects when one of the rewrite's own input files was
+# removed, allowing concurrent appends of *new* files into the same partition to
+# coexist with the rewrite. ``snapshot`` is safe only when no concurrent process
+# deletes data from the touched partitions (e.g. an append-only writer).
+CONFLICT_ISOLATION_KEY = "conflict-isolation"
+CONFLICT_ISOLATION_SERIALIZABLE = "serializable"
+CONFLICT_ISOLATION_SNAPSHOT = "snapshot"
+_VALID_CONFLICT_ISOLATIONS = (
+    CONFLICT_ISOLATION_SERIALIZABLE,
+    CONFLICT_ISOLATION_SNAPSHOT,
+)
+
 _STARTING_SEQ_NUMBER_WARNED = False
 
 
@@ -56,6 +72,22 @@ def _warn_unused_starting_sequence_number_once() -> None:
         "currently a no-op; default sequencing applies.",
         stacklevel=3,
     )
+
+
+def _parse_conflict_isolation(raw_options: dict[str, Any]) -> str:
+    """Pop and validate the conflict-isolation option from ``raw_options``.
+
+    The key is removed in place so it never reaches the option validator, which
+    only recognizes planning options. Returns the validated isolation level,
+    defaulting to ``serializable`` when the option is absent.
+    """
+    value = raw_options.pop(CONFLICT_ISOLATION_KEY, CONFLICT_ISOLATION_SERIALIZABLE)
+    if value not in _VALID_CONFLICT_ISOLATIONS:
+        raise ValueError(
+            f"{CONFLICT_ISOLATION_KEY} must be one of {_VALID_CONFLICT_ISOLATIONS}, "
+            f"got {value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -132,6 +164,9 @@ def run(
         parsed_zorder_by = _parse_zorder_columns(zorder_by, table)
 
     raw_options = dict(options or {})
+    # Pop orchestration-only options before the planner validator, which rejects
+    # keys it does not recognize.
+    conflict_isolation = _parse_conflict_isolation(raw_options)
     # Fall back to the table property when the caller did not pass an explicit
     # target file size; this lets writers and the rewriter agree on output size
     # without restating it at every callsite.
@@ -237,6 +272,7 @@ def run(
         normalized_options=normalized,
         branch=branch,
         starting_snapshot_id=starting_snapshot_id,
+        conflict_isolation=conflict_isolation,
     )
 
     if normalized.get("remove-dangling-deletes"):
@@ -669,6 +705,7 @@ def _commit(
     normalized_options: dict[str, Any],
     branch: str | None,
     starting_snapshot_id: int | None,
+    conflict_isolation: str,
 ) -> RewriteResult:
     """Dispatch single-commit or partial-progress commit based on options."""
     if not outputs:
@@ -700,6 +737,7 @@ def _commit(
             ),
             branch=branch,
             starting_snapshot_id=starting_snapshot_id,
+            conflict_isolation=conflict_isolation,
         )
     return _commit_single(
         table=table,
@@ -709,6 +747,7 @@ def _commit(
         strategy=strategy,
         branch=branch,
         starting_snapshot_id=starting_snapshot_id,
+        conflict_isolation=conflict_isolation,
     )
 
 
@@ -721,6 +760,7 @@ def _commit_single(
     strategy: str,
     branch: str | None,
     starting_snapshot_id: int | None,
+    conflict_isolation: str,
 ) -> RewriteResult:
     result, err = _commit_batch(
         table=table,
@@ -731,6 +771,7 @@ def _commit_single(
         batch_label=None,
         branch=branch,
         starting_snapshot_id=starting_snapshot_id,
+        conflict_isolation=conflict_isolation,
     )
     if result is None:
         assert err is not None
@@ -755,6 +796,7 @@ def _commit_partial(
     max_failed_commits: int,
     branch: str | None,
     starting_snapshot_id: int | None,
+    conflict_isolation: str,
 ) -> RewriteResult:
     n_batches = min(max(1, int(max_commits)), len(outputs))
     chunk_size = (len(outputs) + n_batches - 1) // n_batches
@@ -782,6 +824,7 @@ def _commit_partial(
             batch_label=label,
             branch=branch,
             starting_snapshot_id=starting_snapshot_id,
+            conflict_isolation=conflict_isolation,
         )
         if result is None:
             orphan_paths = _orphan_output_paths(batch)
@@ -836,6 +879,7 @@ def _commit_batch(
     batch_label: str | None,
     branch: str | None,
     starting_snapshot_id: int | None,
+    conflict_isolation: str,
 ) -> tuple[RewriteResult | None, Exception | None]:
     all_data_files = [df_ for o in batch for df_ in o.data_files]
     input_paths = sorted({p for o in batch for p in o.input_data_files})
@@ -895,6 +939,7 @@ def _commit_batch(
             touched_partitions=touched_partitions,
             batch=batch,
             rewrite_id=rewrite_id,
+            isolation=conflict_isolation,
         )
         tx = table.transaction()
         update_kwargs: dict[str, Any] = {"snapshot_properties": snapshot_props}
@@ -944,16 +989,24 @@ def _validate_no_overlap(
     touched_partitions: set[Any],
     batch: list[_GroupOutput],
     rewrite_id: str,
+    isolation: str = CONFLICT_ISOLATION_SERIALIZABLE,
 ) -> None:
     """Reject the commit if foreign writes since the plan snapshot affect this batch.
 
-    Raises :class:`RewriteConflict` when either (a) one of this batch's input
-    files is no longer reachable from the current head, or (b) a foreign
-    snapshot committed after ``starting_snapshot_id`` added a data file in a
-    partition this batch is rewriting. Snapshots produced by the same rewrite
-    (matched by ``daft.rewrite-id``) are excluded so partial-progress batches
-    do not collide with their own predecessors.
+    Under ``serializable`` isolation, raises :class:`RewriteConflict` when either
+    (a) one of this batch's input files is no longer reachable from the current
+    head, or (b) a foreign snapshot committed after ``starting_snapshot_id``
+    added a data file in a partition this batch is rewriting. Under ``snapshot``
+    isolation, only condition (a) is enforced: concurrent additions of new files
+    to a touched partition are permitted, so the check is safe to use only when
+    no concurrent process deletes data from those partitions. Snapshots produced
+    by the same rewrite (matched by ``daft.rewrite-id``) are excluded so
+    partial-progress batches do not collide with their own predecessors.
     """
+    if isolation == CONFLICT_ISOLATION_SNAPSHOT:
+        _raise_if_inputs_vanished(table, input_paths, batch)
+        return
+
     head = table.current_snapshot()
     if head is None or starting_snapshot_id is None or int(head.snapshot_id) == int(starting_snapshot_id):
         _raise_if_inputs_vanished(table, input_paths, batch)
