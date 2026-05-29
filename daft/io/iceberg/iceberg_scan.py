@@ -81,6 +81,20 @@ def iceberg_partition_spec_to_fields(
     return [_iceberg_partition_field_to_daft_partition_field(iceberg_schema, field) for field in spec.fields]
 
 
+def _read_bloom_filter_pruning_property(iceberg_table: Table) -> bool:
+    """Resolve the Iceberg bloom-filter pruning toggle from table properties.
+
+    Honors the Iceberg-standard naming ``read.parquet.bloom-filter-enabled``.
+    Defaults to ``True``. Set the property to ``"false"`` (or 0/no/off) to
+    skip bloom-filter IO entirely for this table.
+    """
+    props = getattr(iceberg_table, "properties", None) or {}
+    raw = props.get("read.parquet.bloom-filter-enabled")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"false", "0", "no", "off"}
+
+
 class IcebergScanOperator(ScanOperator):
     def __init__(
         self,
@@ -99,6 +113,7 @@ class IcebergScanOperator(ScanOperator):
         self._field_id_mapping = visit(iceberg_schema, SchemaFieldIdMappingVisitor())
         self._schema = convert_iceberg_schema(iceberg_schema)
         self._partition_keys = iceberg_partition_spec_to_fields(iceberg_schema, self._iceberg_table.spec())
+        self._bloom_filter_pruning: bool = _read_bloom_filter_pruning_property(iceberg_table)
 
     def schema(self) -> Schema:
         return self._schema
@@ -191,6 +206,7 @@ class IcebergScanOperator(ScanOperator):
             rows_left = limit
         else:
             rows_left = 0
+        bloom_pruning_enabled = self._bloom_filter_pruning and pushdowns.filters is not None
         for task in iceberg_tasks:
             if should_limit_files and (rows_left <= 0):
                 break
@@ -208,6 +224,31 @@ class IcebergScanOperator(ScanOperator):
 
             iceberg_delete_files = [f.file_path for f in task.delete_files]
 
+            # Bloom-filter pruning at plan time: when a row filter has been
+            # pushed down, walk it and probe each file's bloom filters to
+            # narrow the row-group set we'll fetch. A return of None means
+            # the prune pass declined (no probable predicate, missing
+            # blooms, missing pyarrow libs, etc.) — fall through to full
+            # scan. An empty list means the file's row groups are all
+            # provably absent and the whole task can be skipped.
+            row_groups: list[int] | None = None
+            if bloom_pruning_enabled and file_format == "PARQUET" and not iceberg_delete_files:
+                try:
+                    from daft._parquet_bloom import prune_row_groups_for_iceberg
+
+                    row_groups = prune_row_groups_for_iceberg(
+                        self._iceberg_table.io,
+                        path,
+                        row_filter,
+                        self._iceberg_schema,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("bloom pruning failed for %s: %s", path, e)
+                    row_groups = None
+                if row_groups is not None and not row_groups:
+                    # Whole file provably unmatchable. Skip the scan task.
+                    continue
+
             # TODO: Thread in Statistics to each ScanTask: P2
             pspec = self._iceberg_record_to_partition_spec(self._iceberg_table.specs()[file.spec_id], file.partition)
             st = ScanTask.catalog_scan_task(
@@ -221,6 +262,7 @@ class IcebergScanOperator(ScanOperator):
                 pushdowns=pushdowns,
                 partition_values=pspec._recordbatch if pspec is not None else None,
                 stats=None,
+                row_groups=row_groups,
             )
             if st is None:
                 continue

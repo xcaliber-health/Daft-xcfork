@@ -2349,6 +2349,7 @@ dependencies = [
  "daft-micropartition",
  "daft-minhash",
  "daft-parquet",
+ "daft-parquet-bloom",
  "daft-partition-refs",
  "daft-recordbatch",
  "daft-runners",
@@ -3248,6 +3249,15 @@ dependencies = [
  "tango-bench",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "daft-parquet-bloom"
+version = "0.3.0-dev0"
+dependencies = [
+ "cc",
+ "common-error",
+ "pyo3",
 ]
 
 [[package]]

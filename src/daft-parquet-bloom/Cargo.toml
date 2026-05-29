@@ -1,0 +1,27 @@
+[package]
+edition = {workspace = true}
+name = "daft-parquet-bloom"
+version = {workspace = true}
+
+[lib]
+# This crate produces a static rlib that is linked into the top-level `daft`
+# cdylib (via `src/lib.rs::pymodule`). The C++ shim is compiled in by build.rs
+# and linked alongside Rust object files. We do NOT build a standalone cdylib
+# here — there is only one Python extension module (`daft`).
+crate-type = ["rlib"]
+
+[dependencies]
+common-error = {path = "../common/error", default-features = false}
+pyo3 = {workspace = true, optional = true}
+
+[build-dependencies]
+cc = "1.1"
+
+[features]
+# Python is required: this crate exists solely to surface a Python class.
+# The feature flag mirrors the convention of every other Daft crate that
+# exposes PyO3 bindings, even though there is no non-Python consumer today.
+python = ["dep:pyo3", "common-error/python"]
+
+[lints]
+workspace = true

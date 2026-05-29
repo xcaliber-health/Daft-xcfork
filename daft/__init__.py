@@ -23,6 +23,23 @@ if "COV_CORE_SOURCE" in os.environ:
         )
 
 ###
+# Windows: register PyArrow's DLL directory before loading daft.pyd so
+# arrow.dll / parquet.dll / arrow_python.dll resolve at import time.
+# On Linux/macOS the linker RPATH or LD_LIBRARY_PATH handles this.
+###
+import sys as _sys
+
+if _sys.platform == "win32":
+    try:
+        import pyarrow as _pa
+        os.add_dll_directory(os.path.dirname(_pa.__file__))
+        del _pa
+    except Exception:
+        pass
+
+del _sys
+
+###
 # Get build constants from Rust .so
 ###
 

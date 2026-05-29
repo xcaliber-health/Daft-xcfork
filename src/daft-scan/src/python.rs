@@ -696,7 +696,8 @@ pub mod pylib {
             iceberg_delete_files=None,
             pushdowns=None,
             partition_values=None,
-            stats=None
+            stats=None,
+            row_groups=None
         ))]
         pub fn catalog_scan_task(
             file: String,
@@ -709,6 +710,7 @@ pub mod pylib {
             pushdowns: Option<PyPushdowns>,
             partition_values: Option<PyRecordBatch>,
             stats: Option<PyRecordBatch>,
+            row_groups: Option<Vec<i64>>,
         ) -> PyResult<Option<Self>> {
             if let Some(ref pvalues) = partition_values
                 && let Some(Some(partition_filters)) =
@@ -740,6 +742,12 @@ pub mod pylib {
 
             let metadata = num_rows.map(|n| TableMetadata { length: n as usize });
 
+            // When the catalog (e.g. Iceberg bloom pruning at scan-plan
+            // time) has narrowed the surviving row-group set for this
+            // file, encode it as a ChunkSpec so the per-task reader only
+            // fetches those row groups.
+            let chunk_spec = row_groups.map(crate::ChunkSpec::Parquet);
+
             let data_source = ScanSource {
                 size_bytes,
                 metadata,
@@ -747,7 +755,7 @@ pub mod pylib {
                 partition_spec: Some(pspec),
                 kind: ScanSourceKind::File {
                     path: file,
-                    chunk_spec: None,
+                    chunk_spec,
                     iceberg_delete_files,
                     parquet_metadata: None,
                 },

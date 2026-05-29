@@ -134,6 +134,7 @@ pub mod pylib {
         daft_local_plan::register_modules(m)?;
         daft_logical_plan::register_modules(m)?;
         daft_parquet::register_modules(m)?;
+        daft_parquet_bloom::register_modules(m)?;
         daft_partition_refs::register_modules(m)?;
         daft_micropartition::register_modules(m)?;
         daft_recordbatch::register_modules(m)?;
