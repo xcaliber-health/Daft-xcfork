@@ -1100,8 +1100,16 @@ class ScanTask:
         pushdowns: PyPushdowns | None,
         partition_values: PyRecordBatch | None,
         stats: PyRecordBatch | None,
+        row_groups: list[int] | None = None,
     ) -> ScanTask | None:
-        """Create a Catalog Scan Task."""
+        """Create a Catalog Scan Task.
+
+        Args:
+            row_groups: Optional explicit row-group selection for this file.
+                ``None`` (default) reads all row groups. Used by callers
+                (e.g. Iceberg bloom-filter pruning at plan time) that
+                already narrowed the row-group set.
+        """
         ...
 
     @staticmethod

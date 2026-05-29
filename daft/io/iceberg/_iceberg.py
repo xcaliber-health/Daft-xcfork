@@ -74,6 +74,10 @@ def read_iceberg(
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
 
+    Bloom-filter pruning is controlled by the table property ``read.parquet.bloom-filter-enabled``
+    (default ``true``). Set it to ``"false"`` to disable. Pruning is a no-op when no equality/IN
+    predicates are pushed down, or when files lack bloom filters.
+
     Returns:
         DataFrame: a DataFrame with the schema converted from the specified Iceberg table
 
@@ -114,7 +118,11 @@ def read_iceberg(
     multithreaded_io = runners.get_or_create_runner().name != "ray"
     storage_config = StorageConfig(multithreaded_io, io_config)
 
-    iceberg_operator = IcebergScanOperator(table, snapshot_id=snapshot_id, storage_config=storage_config)
+    iceberg_operator = IcebergScanOperator(
+        table,
+        snapshot_id=snapshot_id,
+        storage_config=storage_config,
+    )
 
     handle = ScanOperatorHandle.from_python_scan_operator(iceberg_operator)
     builder = LogicalPlanBuilder.from_tabular_scan(scan_operator=handle)
