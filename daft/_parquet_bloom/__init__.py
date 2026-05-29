@@ -6,21 +6,12 @@ pyiceberg ``BooleanExpression`` describing the row filter, return the list
 of row group indices that still need to be scanned. A return of ``None``
 means "could not run bloom pruning, scan everything" — the caller must
 treat ``None`` as a soft-fail, not an error.
-
-Side-effect of importing this module: it preloads PyArrow's
-libparquet/libarrow/libarrow_python via :mod:`._preload`. The shim's
-undefined symbols resolve against those once they're in the process. This
-is best-effort: if pyarrow isn't importable, every call below short-circuits
-to ``None``.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-
-from . import _preload as _preload_mod
-from ._preload import preload
 
 if TYPE_CHECKING:
     from pyiceberg.expressions import BooleanExpression
@@ -29,25 +20,11 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Trigger lib preload as a side-effect of import. Daft callers do
-# `from daft._parquet_bloom import prune_row_groups_for_iceberg` — by the
-# time that returns, pyarrow's libraries are in the process.
-preload()
-
 
 def _try_get_reader_cls():
-    """Look up the PyO3 reader class by name. Import is delayed so this
-    module stays loadable when the preload step failed (e.g. pyarrow not
-    importable in the host venv): callers see ``None`` instead of an
-    ``ImportError`` at module import time.
-
-    Reads ``_preload.preloaded`` via the module reference because the
-    preload function mutates the value AFTER this module imports — a
-    plain ``from ._preload import preloaded`` would capture the initial
-    ``False`` and never see the update.
-    """
-    if not _preload_mod.preloaded:
-        return None
+    """Look up the PyO3 reader class by name. Returns ``None`` if the daft
+    build did not include the bloom shim (so pruning silently disables
+    rather than crashing the whole scan plan)."""
     try:
         from daft.daft import ParquetBloomReader
 
@@ -80,8 +57,7 @@ def prune_row_groups_for_iceberg(
     """
     reader_cls = _try_get_reader_cls()
     if reader_cls is None:
-        if _preload_mod.preload_error is not None:
-            _logger.debug("bloom pruning skipped: %s", _preload_mod.preload_error)
+        _logger.debug("bloom pruning skipped: daft.daft.ParquetBloomReader not available")
         return None
 
     from ._walk import extract_probes
