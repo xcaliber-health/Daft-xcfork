@@ -73,20 +73,16 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install build tools
-        run: uv pip install --system yq
-
       - name: Patch versions
+        env:
+          PEP440: ${{ needs.compute-version.outputs.pep440 }}
+          CARGO: ${{ needs.compute-version.outputs.cargo }}
         run: |
-          PEP440="${{ needs.compute-version.outputs.pep440 }}"
-          CARGO="${{ needs.compute-version.outputs.cargo }}"
           echo "Cargo version: $CARGO | Wheel version: $PEP440"
-          # Patch Cargo.toml to valid SemVer (base version only)
-          tomlq -i -t ".package.version = \"$CARGO\""           Cargo.toml
-          tomlq -i -t ".workspace.package.version = \"$CARGO\"" Cargo.toml
-          # Override wheel version in pyproject.toml (PEP 440)
-          tomlq -i -t ".project.version = \"$PEP440\"" pyproject.toml
-          tomlq -i -t '.project.dynamic = (.project.dynamic | map(select(. != "version")))' pyproject.toml
+          # Patch all `version = "..."` lines in Cargo.toml (package + workspace.package)
+          perl -i -pe "s/^version = \"[^\"]*\"\$/version = \"$CARGO\"/" Cargo.toml
+          # In pyproject.toml: replace `dynamic = [...]` line with static version
+          perl -i -pe "s/^dynamic = \[.*\]\$/version = \"$PEP440\"/" pyproject.toml
 
       - name: Setup Node
         uses: actions/setup-node@v4
