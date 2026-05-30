@@ -1,0 +1,244 @@
+name: Build and publish platform wheels
+
+# Triggered on tags matching v<version>-platform.<N>
+# e.g. v0.7.14-platform.2 → builds daft==0.7.14.post2 wheels and publishes
+# to GitHub Releases + GitHub Pages simple PyPI index.
+#
+# SETUP REQUIRED (one-time):
+#   1. Enable GitHub Pages in repo Settings → Pages → Deploy from branch "gh-pages"
+#   2. Ensure GITHUB_TOKEN has write access to contents (default for public repos)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*-platform.[0-9]*'
+
+permissions:
+  contents: write
+  pages: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  DAFT_ANALYTICS_ENABLED: "0"
+  DAFT_PROGRESS_BAR: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compute-version:
+    runs-on: ubuntu-latest
+    outputs:
+      pep440: ${{ steps.parse.outputs.pep440 }}
+      cargo: ${{ steps.parse.outputs.cargo }}
+      tag: ${{ steps.parse.outputs.tag }}
+    steps:
+      - name: Parse tag to PEP 440 and Cargo versions
+        id: parse
+        run: |
+          TAG="${{ github.ref_name }}"
+          # v0.7.14-platform.2 → BASE=0.7.14, NUM=2
+          BASE=$(echo "$TAG" | sed 's/-platform\..*//' | sed 's/^v//')
+          NUM=$(echo "$TAG" | grep -oP '(?<=-platform\.)\d+')
+          PEP440="${BASE}.post${NUM}"
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "pep440=$PEP440" >> "$GITHUB_OUTPUT"
+          echo "cargo=$BASE"   >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG → PEP 440: $PEP440 | Cargo: $BASE"
+
+  build:
+    needs: compute-version
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            arch: x86_64
+            runner: ubuntu-22.04
+            manylinux: "2_24"
+          - os: macos
+            arch: aarch64
+            runner: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python and uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build tools
+        run: uv pip install --system yq
+
+      - name: Patch versions
+        run: |
+          PEP440="${{ needs.compute-version.outputs.pep440 }}"
+          CARGO="${{ needs.compute-version.outputs.cargo }}"
+          echo "Cargo version: $CARGO | Wheel version: $PEP440"
+          # Patch Cargo.toml to valid SemVer (base version only)
+          tomlq -i -t ".package.version = \"$CARGO\""           Cargo.toml
+          tomlq -i -t ".workspace.package.version = \"$CARGO\"" Cargo.toml
+          # Override wheel version in pyproject.toml (PEP 440)
+          tomlq -i -t ".project.version = \"$PEP440\"" pyproject.toml
+          tomlq -i -t '.project.dynamic = (.project.dynamic | map(select(. != "version")))' pyproject.toml
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: src/daft-dashboard/frontend/package-lock.json
+
+      - name: Build dashboard
+        working-directory: ./src/daft-dashboard/frontend
+        run: npm ci && npm run build
+
+      - name: Build wheel (Linux x86_64)
+        if: matrix.os == 'ubuntu'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: ${{ matrix.manylinux }}
+          args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
+        env:
+          RUST_DAFT_PKG_BUILD_TYPE: release
+          GITHUB_ACTIONS: "true"
+
+      - name: Build wheel (macOS aarch64)
+        if: matrix.os == 'macos'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: -i python${{ env.PYTHON_VERSION }} --profile release --out dist
+        env:
+          RUST_DAFT_PKG_BUILD_TYPE: release
+          RUSTFLAGS: -Ctarget-cpu=apple-m1
+          CFLAGS: -mtune=apple-m1
+          GITHUB_ACTIONS: "true"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.whl
+
+  publish:
+    needs: [compute-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release and upload wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.compute-version.outputs.tag }}"
+          PEP440="${{ needs.compute-version.outputs.pep440 }}"
+
+          # Write release notes to a file to avoid YAML/shell quoting issues
+          cat > /tmp/release-notes.md << NOTES
+          Pre-built platform wheels for daft==$PEP440.
+
+          pip install:
+            pip install daft==$PEP440 --extra-index-url https://xcaliber-health.github.io/Daft/simple/
+
+          pyproject.toml (uv):
+            dependencies = ["daft==$PEP440"]
+            [[tool.uv.indexes]]
+            name = "xcaliber-daft"
+            url = "https://xcaliber-health.github.io/Daft/simple/"
+            explicit = true
+            [tool.uv.sources]
+            daft = { index = "xcaliber-daft" }
+          NOTES
+
+          # Create release if it doesn't exist yet
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Platform release $TAG (daft==$PEP440)" \
+              --notes-file /tmp/release-notes.md
+
+          gh release upload "$TAG" dist/*.whl \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Fetch existing simple index from gh-pages
+        run: |
+          mkdir -p _site/simple/daft
+          git fetch origin gh-pages 2>/dev/null || true
+
+          # Restore existing index files from gh-pages (accumulate across releases)
+          if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
+            git show origin/gh-pages:simple/daft/index.html > _site/simple/daft/index.html 2>/dev/null || true
+            git show origin/gh-pages:simple/index.html      > _site/simple/index.html      2>/dev/null || true
+          fi
+
+          # Create root index if missing
+          if [ ! -f _site/simple/index.html ]; then
+            cat > _site/simple/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Simple index</title></head>
+          <body>
+          <h1>Simple index</h1>
+          <a href="daft/">daft</a>
+          </body>
+          </html>
+          EOF
+          fi
+
+          # Create package index if missing
+          if [ ! -f _site/simple/daft/index.html ]; then
+            cat > _site/simple/daft/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Links for daft</title></head>
+          <body>
+          <h1>Links for daft</h1>
+          </body>
+          </html>
+          EOF
+          fi
+
+      - name: Append new wheel links to index
+        run: |
+          TAG="${{ needs.compute-version.outputs.tag }}"
+          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
+
+          for whl in dist/*.whl; do
+            FILENAME=$(basename "$whl")
+            SHA256=$(sha256sum "$whl" | awk '{print $1}')
+            DOWNLOAD_URL="${REPO_URL}/releases/download/${TAG}/${FILENAME}"
+
+            # Skip duplicates
+            grep -q "$FILENAME" _site/simple/daft/index.html && continue
+
+            LINK="<a href=\"${DOWNLOAD_URL}#sha256=${SHA256}\">${FILENAME}</a><br/>"
+            sed -i "s|</body>|${LINK}\n</body>|" _site/simple/daft/index.html
+          done
+
+      - name: Deploy index to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          keep_files: true
+          commit_message: "Add wheels for ${{ needs.compute-version.outputs.tag }}"

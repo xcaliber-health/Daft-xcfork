@@ -1,8 +1,7 @@
 name: Run notebooks in docs to ensure they work
 
 on:
-  schedule:
-  - cron: 0 20 * * *
+  # Disabled in xcaliber fork — not maintaining upstream notebooks.
   workflow_dispatch:
 
 permissions:

@@ -1,8 +1,7 @@
 name: Run property based tests with Hypothesis
 
 on:
-  schedule:
-  - cron: 0 20 * * *
+  # Disabled in xcaliber fork — run explicitly when needed.
   workflow_dispatch:
 
 permissions:

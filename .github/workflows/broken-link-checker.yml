@@ -1,8 +1,7 @@
 name: Check Broken Links on daft.ai
 
 on:
-  schedule:
-  - cron: 0 20 * * *
+  # Disabled in xcaliber fork — not maintaining daft.ai docs.
   workflow_dispatch:
 
 permissions: {}

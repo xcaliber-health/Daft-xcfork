@@ -4,11 +4,8 @@
 name: Build docs
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+  # Disabled in xcaliber fork — not maintaining upstream docs site.
+  workflow_dispatch:
 
 permissions:
   contents: read
