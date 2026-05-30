@@ -79,8 +79,14 @@ jobs:
           CARGO: ${{ needs.compute-version.outputs.cargo }}
         run: |
           echo "Cargo version: $CARGO | Wheel version: $PEP440"
-          # Patch all `version = "..."` lines in Cargo.toml (package + workspace.package)
-          perl -i -pe "s/^version = \"[^\"]*\"\$/version = \"$CARGO\"/" Cargo.toml
+          # Patch version ONLY in [workspace.package] section of Cargo.toml.
+          # [workspace.dependencies.*] also have bare `version = "..."` lines — must not touch those.
+          awk -v cargo="$CARGO" '
+            /^\[workspace\.package\]/            { in_wp=1 }
+            /^\[/ && !/^\[workspace\.package\]/  { in_wp=0 }
+            in_wp && /^version = /               { sub(/version = "[^"]*"/, "version = \"" cargo "\"") }
+            { print }
+          ' Cargo.toml > /tmp/Cargo.toml.patched && mv /tmp/Cargo.toml.patched Cargo.toml
           # In pyproject.toml: replace `dynamic = [...]` line with static version
           perl -i -pe "s/^dynamic = \[.*\]\$/version = \"$PEP440\"/" pyproject.toml
 
