@@ -392,12 +392,35 @@ class LogicalPlanBuilder:
         )
         return LogicalPlanBuilder(builder)
 
-    def write_iceberg(self, table: IcebergTable, io_config: IOConfig) -> LogicalPlanBuilder:
+    def write_iceberg(
+        self,
+        table: IcebergTable,
+        io_config: IOConfig,
+        target_file_size_bytes: int | None = None,
+        partition_spec_id: int | None = None,
+    ) -> LogicalPlanBuilder:
+        """Build a plan that writes this DataFrame as data files for a destination table.
+
+        Parameters
+        ----------
+        table
+            The destination table handle.
+        io_config
+            Object-store access configuration for the write.
+        target_file_size_bytes
+            When set, overrides the destination table's target output-file size so
+            the writer rolls files at this size. Used by compaction to honor a
+            per-call target independent of the table property.
+        partition_spec_id
+            When set, writes using the destination's partition spec with this id
+            rather than its current spec. Used by compaction when re-clustering a
+            group into a different partitioning.
+        """
         from daft.io.iceberg.iceberg_write import get_missing_columns, partition_field_to_expr
 
         name = ".".join(table.name())
         location = table.metadata.properties.get("write.data.path", f"{table.location()}/data")
-        partition_spec = table.spec()
+        partition_spec = table.spec() if partition_spec_id is None else table.specs()[partition_spec_id]
         schema = table.schema()
         missing_columns = get_missing_columns(self.schema().to_pyarrow_schema(), schema)
         builder = (
@@ -406,7 +429,9 @@ class LogicalPlanBuilder:
             else self._builder.with_columns([c._expr for c in missing_columns])
         )
         partition_cols = [partition_field_to_expr(field, schema)._expr for field in partition_spec.fields]
-        props = table.properties
+        props = dict(table.properties)
+        if target_file_size_bytes is not None:
+            props["write.target-file-size-bytes"] = str(int(target_file_size_bytes))
         columns = [col.name for col in schema.columns]
         builder = builder.iceberg_write(
             name, location, partition_spec.spec_id, partition_cols, schema, props, columns, io_config

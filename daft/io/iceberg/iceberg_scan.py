@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from pyiceberg.partitioning import PartitionField as IcebergPartitionField
     from pyiceberg.partitioning import PartitionSpec as IcebergPartitionSpec
-    from pyiceberg.table import Table
+    from pyiceberg.table import FileScanTask, Table
     from pyiceberg.typedef import Record
 
 logger = logging.getLogger(__name__)
@@ -194,39 +194,45 @@ class IcebergScanOperator(ScanOperator):
         for task in iceberg_tasks:
             if should_limit_files and (rows_left <= 0):
                 break
-            file = task.file
-            path = file.file_path
-            record_count = file.record_count
-            file_format = file.file_format
-            if file_format == "PARQUET":
-                file_format_config = FileFormatConfig.from_parquet_config(
-                    ParquetSourceConfig(field_id_mapping=self._field_id_mapping)
-                )
-            else:
-                # TODO: Support ORC and AVRO when we can read it
-                raise NotImplementedError(f"{file_format} for iceberg not implemented!")
-
-            iceberg_delete_files = [f.file_path for f in task.delete_files]
-
-            # TODO: Thread in Statistics to each ScanTask: P2
-            pspec = self._iceberg_record_to_partition_spec(self._iceberg_table.specs()[file.spec_id], file.partition)
-            st = ScanTask.catalog_scan_task(
-                file=path,
-                file_format=file_format_config,
-                schema=self._schema._schema,
-                num_rows=record_count,
-                storage_config=self._storage_config,
-                size_bytes=file.file_size_in_bytes,
-                iceberg_delete_files=iceberg_delete_files,
-                pushdowns=pushdowns,
-                partition_values=pspec._recordbatch if pspec is not None else None,
-                stats=None,
-            )
+            st = self._scan_task_for_file_task(task, pushdowns)
             if st is None:
                 continue
-            rows_left -= record_count
+            rows_left -= task.file.record_count
             scan_tasks.append(st)
         return iter(scan_tasks)
+
+    def _scan_task_for_file_task(self, task: FileScanTask, pushdowns: PyPushdowns) -> ScanTask | None:
+        """Build one scan task for a planned data file, applying its delete files.
+
+        Resolves the read schema via field-id mapping so schema evolution is honored
+        and threads the file's positional delete files so they are applied during read.
+        """
+        file = task.file
+        file_format = file.file_format
+        if file_format == "PARQUET":
+            file_format_config = FileFormatConfig.from_parquet_config(
+                ParquetSourceConfig(field_id_mapping=self._field_id_mapping)
+            )
+        else:
+            # TODO: Support ORC and AVRO when we can read it
+            raise NotImplementedError(f"{file_format} for iceberg not implemented!")
+
+        iceberg_delete_files = [f.file_path for f in task.delete_files]
+
+        # TODO: Thread in Statistics to each ScanTask: P2
+        pspec = self._iceberg_record_to_partition_spec(self._iceberg_table.specs()[file.spec_id], file.partition)
+        return ScanTask.catalog_scan_task(
+            file=file.file_path,
+            file_format=file_format_config,
+            schema=self._schema._schema,
+            num_rows=file.record_count,
+            storage_config=self._storage_config,
+            size_bytes=file.file_size_in_bytes,
+            iceberg_delete_files=iceberg_delete_files,
+            pushdowns=pushdowns,
+            partition_values=pspec._recordbatch if pspec is not None else None,
+            stats=None,
+        )
 
     def _create_count_scan_task(self, pushdowns: PyPushdowns, field_name: str) -> Iterator[ScanTask]:
         """Create count pushdown scan task using Iceberg metadata."""
@@ -309,3 +315,40 @@ class IcebergScanOperator(ScanOperator):
 
     def supported_count_modes(self) -> list[CountMode]:
         return [CountMode.All]
+
+
+class IcebergFileGroupScanOperator(IcebergScanOperator):
+    """Scan operator over an explicit set of planned data files.
+
+    Unlike the base operator, which plans every file in a snapshot, this reads
+    exactly the supplied files. Compaction uses it to materialize one file group
+    as a lazy frame so the read, transform, and write flow through the streaming
+    engine instead of loading the whole group into memory at once.
+    """
+
+    def __init__(
+        self,
+        iceberg_table: Table,
+        snapshot_id: int | None,
+        storage_config: StorageConfig,
+        tasks: list[FileScanTask],
+    ) -> None:
+        super().__init__(iceberg_table, snapshot_id=snapshot_id, storage_config=storage_config)
+        self._tasks = tasks
+
+    def name(self) -> str:
+        return "IcebergFileGroupScanOperator"
+
+    def display_name(self) -> str:
+        return f"IcebergFileGroupScanOperator({'.'.join(self._iceberg_table.name())})"
+
+    def _create_regular_scan_tasks(self, pushdowns: PyPushdowns) -> Iterator[ScanTask]:
+        scan_tasks = []
+        for task in self._tasks:
+            st = self._scan_task_for_file_task(task, pushdowns)
+            if st is not None:
+                scan_tasks.append(st)
+        return iter(scan_tasks)
+
+    def supports_count_pushdown(self) -> bool:
+        return False

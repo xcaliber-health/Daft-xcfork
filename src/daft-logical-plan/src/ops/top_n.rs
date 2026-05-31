@@ -61,9 +61,10 @@ impl TopN {
         let sort_by_schema = exprs_to_schema(&sort_by, input.schema())?;
 
         for (field, expr) in sort_by_schema.into_iter().zip(sort_by.iter()) {
-            // Disallow sorting by null, binary, and boolean columns.
-            // TODO(Clark): This is a port of an existing constraint, we should look at relaxing this.
-            if let dt @ (DataType::Null | DataType::Binary) = &field.dtype {
+            // Disallow sorting by null columns; their order is undefined. Binary is
+            // permitted: it sorts by lexicographic byte order, which the sort kernel
+            // supports and which z-order clustering relies on.
+            if let dt @ DataType::Null = &field.dtype {
                 return Err(DaftError::ValueError(format!(
                     "Cannot sort on expression {expr} with type: {dt}",
                 )))
