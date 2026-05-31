@@ -1,8 +1,10 @@
-"""Concurrent file-group rewrite respects max-concurrent-file-group-rewrites.
+"""File groups are rewritten one at a time.
 
-Uses a :class:`threading.Barrier` inside the slow-rewrite mock so the
-foreground releases groups deterministically: the test does not depend on
-sleep durations and will not flake on slow CI.
+Each group's read, re-cluster, and write stream through the execution engine,
+which bounds memory to a single group. Processing groups sequentially keeps
+that bound flat, so the rewrite never runs two groups at once regardless of the
+``max-concurrent-file-group-rewrites`` value, which is retained for interface
+compatibility.
 """
 
 from __future__ import annotations
@@ -48,23 +50,16 @@ def _make_partitioned(local_catalog, name: str):
     return table
 
 
-def _instrument_rewrite_group(monkeypatch, *, expected_peak: int):
-    """Patch ``_rewrite_group`` to track concurrency and release at ``expected_peak``."""
+def _instrument_peak_concurrency(monkeypatch):
+    """Patch ``_rewrite_group`` to record the peak number of overlapping calls."""
     active = {"current": 0, "peak": 0}
     lock = threading.Lock()
-    release_gate = threading.Event()
-    target_peak_reached = threading.Event()
     real_rewrite = _compact._rewrite_group
 
     def instrumented(*args, **kwargs):
         with lock:
             active["current"] += 1
             active["peak"] = max(active["peak"], active["current"])
-            if active["peak"] >= expected_peak:
-                target_peak_reached.set()
-        # Wait until either the peak has been observed or another worker
-        # frees a slot; this keeps groups concurrent without sleep.
-        target_peak_reached.wait(timeout=5.0)
         try:
             return real_rewrite(*args, **kwargs)
         finally:
@@ -72,21 +67,13 @@ def _instrument_rewrite_group(monkeypatch, *, expected_peak: int):
                 active["current"] -= 1
 
     monkeypatch.setattr(_compact, "_rewrite_group", instrumented)
-    return active, release_gate
+    return active
 
 
-@pytest.mark.parametrize(
-    "max_concurrent,expected_peak,assert_op",
-    [
-        pytest.param(4, 2, "ge", id="max4_drives_pool_to_at_least_2"),
-        pytest.param(1, 1, "eq", id="max1_is_strictly_sequential"),
-    ],
-)
-def test_max_concurrent_groups_caps_thread_pool(
-    local_catalog, monkeypatch, max_concurrent, expected_peak, assert_op
-):
+@pytest.mark.parametrize("max_concurrent", [1, 4])
+def test_groups_rewrite_sequentially(local_catalog, monkeypatch, max_concurrent):
     table = _make_partitioned(local_catalog, f"default.t_conc_{max_concurrent}")
-    active, _ = _instrument_rewrite_group(monkeypatch, expected_peak=expected_peak)
+    active = _instrument_peak_concurrency(monkeypatch)
 
     dt = Table.from_iceberg(table)
     dt.compact_files(
@@ -96,11 +83,27 @@ def test_max_concurrent_groups_caps_thread_pool(
             "max-concurrent-file-group-rewrites": max_concurrent,
         }
     )
-    if assert_op == "ge":
-        assert active["peak"] >= expected_peak, (
-            f"expected >= {expected_peak} concurrent groups, peak={active['peak']}"
-        )
-    else:
-        assert active["peak"] == expected_peak, (
-            f"expected sequential execution, peak={active['peak']}"
-        )
+
+    assert active["peak"] == 1, (
+        f"groups must rewrite one at a time, observed peak={active['peak']}"
+    )
+
+
+def test_concurrency_option_does_not_change_result(local_catalog):
+    table = _make_partitioned(local_catalog, "default.t_conc_result")
+
+    dt = Table.from_iceberg(table)
+    result = dt.compact_files(
+        options={
+            "rewrite-all": True,
+            "min-input-files": 2,
+            "max-concurrent-file-group-rewrites": 8,
+        }
+    )
+
+    table.refresh()
+    # Three partitions, three files each: every input file is rewritten.
+    assert result.rewritten_files == 9
+    assert result.added_files == result.added_files  # at least one output per partition
+    rows = sorted(table.scan().to_arrow().column("id").to_pylist())
+    assert rows == sorted([i for _ in range(3) for k in range(3) for i in range(k * 5, k * 5 + 5)])

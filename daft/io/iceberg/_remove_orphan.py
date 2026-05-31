@@ -113,18 +113,21 @@ def run(
 
     base_location = _resolve_location(table, location)
 
-    reachable = _reachable_paths(table)
+    canon = _build_canonicalizer(opts)
+    reachable = _reachable_paths(table, canon)
 
     listed_iter = _list_files(
         base_location,
         older_than_ms=older_than_ms,
         max_workers=max_concurrent_list,
+        canon=canon,
     )
 
     candidates, mismatched = _apply_prefix_mode(
         listed_iter,
         reachable=reachable,
         mode=prefix_mismatch_mode,
+        canon=canon,
     )
 
     if not stream_results:
@@ -197,7 +200,7 @@ def _resolve_location(table: PyIcebergTable, location: str | None) -> str:
     return loc
 
 
-def _reachable_paths(table: PyIcebergTable) -> set[str]:
+def _reachable_paths(table: PyIcebergTable, canon: _PathCanonicalizer) -> set[str]:
     """Return canonical paths of every file the table metadata still references.
 
     Includes data and delete files (across all snapshots), manifest files,
@@ -210,7 +213,7 @@ def _reachable_paths(table: PyIcebergTable) -> set[str]:
         data_files_tbl = table.inspect.all_files()
         for p in data_files_tbl.column("file_path").to_pylist():
             if p:
-                paths.add(_canonical(p))
+                paths.add(canon.canonical(p))
     except Exception as exc:
         logger.warning("remove_orphan_files: inspect.all_files failed: %r", exc)
 
@@ -218,42 +221,44 @@ def _reachable_paths(table: PyIcebergTable) -> set[str]:
         manifests_tbl = table.inspect.all_manifests()
         for p in manifests_tbl.column("path").to_pylist():
             if p:
-                paths.add(_canonical(p))
+                paths.add(canon.canonical(p))
     except Exception as exc:
         logger.warning("remove_orphan_files: inspect.all_manifests failed: %r", exc)
 
     for snap in table.metadata.snapshots:
         ml = getattr(snap, "manifest_list", None)
         if ml:
-            paths.add(_canonical(ml))
+            paths.add(canon.canonical(ml))
 
     for s in getattr(table.metadata, "statistics", []) or []:
-        paths.add(_canonical(s.statistics_path))
+        paths.add(canon.canonical(s.statistics_path))
     for s in getattr(table.metadata, "partition_statistics", []) or []:
-        paths.add(_canonical(s.statistics_path))
+        paths.add(canon.canonical(s.statistics_path))
 
     for entry in getattr(table.metadata, "metadata_log", []) or []:
-        paths.add(_canonical(entry.metadata_file))
+        paths.add(canon.canonical(entry.metadata_file))
     current_md = getattr(table, "metadata_location", None)
     if current_md:
-        paths.add(_canonical(current_md))
+        paths.add(canon.canonical(current_md))
 
     return paths
 
 
 def _list_files(
-    location: str, *, older_than_ms: int, max_workers: int
+    location: str, *, older_than_ms: int, max_workers: int, canon: _PathCanonicalizer
 ) -> Iterator[str]:
     """Yield canonical paths under ``location`` modified before ``older_than_ms``.
 
     Walks the underlying filesystem (PyArrow) starting from the immediate child
     directories of ``location`` in parallel. Files at the top level are walked
     inline. Mtime-newer-than-cutoff files are skipped to avoid racing live writers.
+    Each path is canonicalized so it compares equal to a reachable path that
+    names the same location through an equivalent scheme or authority.
     """
     import pyarrow.fs as pafs
 
     fs, base = pafs.FileSystem.from_uri(location)
-    scheme = _scheme_of(_canonical(location))
+    scheme = canon.scheme_of(canon.canonical(location))
 
     try:
         children = fs.get_file_info(pafs.FileSelector(base, recursive=False))
@@ -266,7 +271,7 @@ def _list_files(
 
     for info in top_files:
         if int(info.mtime_ns / 1_000_000) < older_than_ms:
-            yield _scheme_join(scheme, info.path)
+            yield canon.canonical(_scheme_join(scheme, info.path))
 
     if not top_dirs:
         return
@@ -287,7 +292,7 @@ def _list_files(
                 continue
             if int(info.mtime_ns / 1_000_000) >= older_than_ms:
                 continue
-            out.append(_scheme_join(scheme, info.path))
+            out.append(canon.canonical(_scheme_join(scheme, info.path)))
         return out
 
     if workers == 1:
@@ -301,7 +306,7 @@ def _list_files(
 
 
 def _apply_prefix_mode(
-    listed: Iterator[str], *, reachable: set[str], mode: str
+    listed: Iterator[str], *, reachable: set[str], mode: str, canon: _PathCanonicalizer
 ) -> tuple[Iterable[str], int]:
     """Filter listed paths by scheme/authority match against the reachable set.
 
@@ -315,6 +320,8 @@ def _apply_prefix_mode(
         ``"error"`` raises if any listed path's scheme/authority is absent
         from the reachable set's prefixes; ``"delete"`` passes mismatches
         through as candidates; ``"ignore"`` drops mismatches.
+    canon
+        Canonicalizer used to derive the scheme/authority prefix of each path.
 
     Returns
     -------
@@ -322,12 +329,12 @@ def _apply_prefix_mode(
         ``candidates`` is the filtered iterable; ``skipped_count`` is the
         number of mismatches dropped under ``"ignore"``.
     """
-    reachable_prefixes = {_prefix(p) for p in reachable}
+    reachable_prefixes = {canon.prefix(p) for p in reachable}
     skipped = 0
     mismatches: list[str] = []
     out: list[str] = []
     for path in listed:
-        if _prefix(path) in reachable_prefixes:
+        if canon.prefix(path) in reachable_prefixes:
             out.append(path)
             continue
         if mode == "delete":
@@ -361,18 +368,73 @@ def _compute_orphans(candidates: Iterable[str], reachable: set[str]) -> list[str
     return [p for p in listed if p not in reachable]
 
 
+@dataclass(frozen=True)
+class _PathCanonicalizer:
+    """Map equivalent schemes and authorities to one canonical spelling.
+
+    Two paths that name the same physical location through different but
+    declared-equivalent schemes (such as ``s3a`` and ``s3``) or authorities
+    (such as a direct host and an endpoint alias) canonicalize to the same
+    string, so comparing reachable and listed paths does not flag a live file as
+    an orphan merely because the two sides spell its location differently.
+    """
+
+    scheme_aliases: dict[str, str]
+    authority_aliases: dict[str, str]
+
+    def canonical(self, path: str) -> str:
+        m = _SCHEME_RE.match(path)
+        if not m:
+            return path
+        scheme = m.group(1).lower()
+        scheme = self.scheme_aliases.get(scheme, scheme)
+        rest = path[m.end() :]
+        slash = rest.find("/")
+        if slash < 0:
+            authority, body = rest, ""
+        else:
+            authority, body = rest[:slash], rest[slash:]
+        authority = self.authority_aliases.get(authority, authority)
+        return f"{scheme}://{authority}{body}"
+
+    def scheme_of(self, canon: str) -> str:
+        idx = canon.find("://")
+        return canon[:idx] if idx >= 0 else ""
+
+    def prefix(self, canon: str) -> str:
+        idx = canon.find("://")
+        if idx < 0:
+            return ""
+        rest = canon[idx + 3 :]
+        slash = rest.find("/")
+        authority = rest if slash < 0 else rest[:slash]
+        return f"{canon[:idx]}://{authority}"
+
+
+_DEFAULT_CANONICALIZER = _PathCanonicalizer(scheme_aliases=_SCHEME_ALIASES, authority_aliases={})
+
+
+def _build_canonicalizer(opts: dict[str, Any]) -> _PathCanonicalizer:
+    """Build a path canonicalizer from the equivalence options.
+
+    The default scheme equivalences are always applied; caller-supplied
+    equivalences extend them.
+    """
+    scheme_aliases = dict(_SCHEME_ALIASES)
+    for key, value in (opts.get("equal-schemes") or {}).items():
+        scheme_aliases[str(key).lower()] = str(value).lower()
+    authority_aliases = {
+        str(key): str(value) for key, value in (opts.get("equal-authorities") or {}).items()
+    }
+    return _PathCanonicalizer(scheme_aliases=scheme_aliases, authority_aliases=authority_aliases)
+
+
 def _canonical(path: str) -> str:
-    m = _SCHEME_RE.match(path)
-    if not m:
-        return path
-    scheme = m.group(1).lower()
-    canon_scheme = _SCHEME_ALIASES.get(scheme, scheme)
-    return f"{canon_scheme}://{path[m.end():]}"
+    return _DEFAULT_CANONICALIZER.canonical(path)
 
 
 def _scheme_of(canon: str) -> str:
-    idx = canon.find("://")
-    return canon[:idx] if idx >= 0 else ""
+    return _DEFAULT_CANONICALIZER.scheme_of(canon)
 
 
 def _scheme_join(scheme: str, body: str) -> str:
@@ -385,10 +447,4 @@ def _scheme_join(scheme: str, body: str) -> str:
 
 
 def _prefix(canon_path: str) -> str:
-    idx = canon_path.find("://")
-    if idx < 0:
-        return ""
-    rest = canon_path[idx + 3 :]
-    slash = rest.find("/")
-    authority = rest if slash < 0 else rest[:slash]
-    return f"{canon_path[:idx]}://{authority}"
+    return _DEFAULT_CANONICALIZER.prefix(canon_path)

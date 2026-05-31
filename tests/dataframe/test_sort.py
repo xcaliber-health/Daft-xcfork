@@ -38,11 +38,12 @@ def test_disallowed_sort_null(make_df):
         df.sort("A")
 
 
-def test_disallowed_sort_bytes(make_df):
-    df = make_df({"A": [b"a", b"b"]})
-
-    with pytest.raises((ExpressionTypeError, ValueError)):
-        df.sort("A")
+def test_sort_bytes_orders_lexicographically(make_df):
+    # Binary columns sort by lexicographic byte order, which the sort kernel
+    # supports and which z-order clustering depends on.
+    df = make_df({"A": [b"b", b"a", b"c"]})
+    result = df.sort("A").to_pydict()
+    assert result["A"] == [b"a", b"b", b"c"]
 
 
 ###

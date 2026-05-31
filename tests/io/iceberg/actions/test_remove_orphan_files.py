@@ -24,6 +24,61 @@ from tests.io.iceberg.actions._helpers import (
 )
 
 
+def test_default_scheme_equivalence_collapses_s3_variants():
+    from daft.io.iceberg._remove_orphan import _build_canonicalizer
+
+    canon = _build_canonicalizer({})
+    assert canon.canonical("s3a://b/x/f.parquet") == canon.canonical("s3://b/x/f.parquet")
+    assert canon.canonical("s3n://b/x/f.parquet") == canon.canonical("s3://b/x/f.parquet")
+
+
+def test_custom_scheme_and_authority_equivalence_collapse():
+    from daft.io.iceberg._remove_orphan import _build_canonicalizer
+
+    canon = _build_canonicalizer(
+        {
+            "equal-schemes": {"myfs": "s3"},
+            "equal-authorities": {"bucket.vpce-123": "bucket"},
+        }
+    )
+    assert canon.canonical("myfs://bucket.vpce-123/t/f.parquet") == canon.canonical(
+        "s3://bucket/t/f.parquet"
+    )
+
+
+def test_equal_authorities_keeps_live_file_listed_under_alias_host():
+    """A reachable file listed under a declared-equivalent host is not an orphan."""
+    from daft.io.iceberg._remove_orphan import (
+        _apply_prefix_mode,
+        _build_canonicalizer,
+        _compute_orphans,
+    )
+
+    canon = _build_canonicalizer({"equal-authorities": {"alias-host": "real-host"}})
+    reachable = {canon.canonical("s3://real-host/t/data/live.parquet")}
+    listed = [canon.canonical("s3://alias-host/t/data/live.parquet")]
+
+    # The alias host shares the canonical prefix, so it is not a prefix mismatch...
+    candidates, skipped = _apply_prefix_mode(
+        iter(listed), reachable=reachable, mode="error", canon=canon
+    )
+    assert skipped == 0
+    # ...and it resolves to a reachable path, so it is never deleted.
+    assert _compute_orphans(list(candidates), reachable) == []
+
+
+def test_unknown_authority_still_flagged_as_mismatch():
+    """A truly foreign authority is still caught by error mode."""
+    from daft.io.iceberg._remove_orphan import _apply_prefix_mode, _build_canonicalizer
+
+    canon = _build_canonicalizer({})
+    reachable = {canon.canonical("s3://real-host/t/data/live.parquet")}
+    listed = [canon.canonical("s3://other-host/t/data/stray.parquet")]
+
+    with pytest.raises(PrefixMismatchError):
+        _apply_prefix_mode(iter(listed), reachable=reachable, mode="error", canon=canon)
+
+
 def _plant_file(directory: str, name: str, content: bytes = b"orphan") -> str:
     path = os.path.join(directory, name)
     os.makedirs(directory, exist_ok=True)
@@ -150,8 +205,8 @@ def test_prefix_mismatch_error_raises(make_tiny_table, monkeypatch):
 
     real = mod._reachable_paths
 
-    def fake_reachable(t):
-        return {p.replace("file://", "s3://fake-bucket/") for p in real(t)}
+    def fake_reachable(t, canon):
+        return {p.replace("file://", "s3://fake-bucket/") for p in real(t, canon)}
 
     monkeypatch.setattr(mod, "_reachable_paths", fake_reachable)
 
@@ -171,8 +226,8 @@ def test_prefix_mismatch_ignore_skips_and_counts(make_tiny_table, monkeypatch):
 
     real = mod._reachable_paths
 
-    def fake_reachable(t):
-        return {p.replace("file://", "s3://fake-bucket/") for p in real(t)}
+    def fake_reachable(t, canon):
+        return {p.replace("file://", "s3://fake-bucket/") for p in real(t, canon)}
 
     monkeypatch.setattr(mod, "_reachable_paths", fake_reachable)
 

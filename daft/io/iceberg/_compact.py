@@ -17,6 +17,9 @@ from daft.io.iceberg._common import (
 if TYPE_CHECKING:
     from pyiceberg.table import Table as PyIcebergTable
 
+    from daft.daft import IOConfig
+    from daft.dataframe import DataFrame
+
 logger = logging.getLogger(__name__)
 
 # Equality deletes are rejected up front; users must apply them before compacting.
@@ -56,23 +59,6 @@ _VALID_CONFLICT_ISOLATIONS = (
     CONFLICT_ISOLATION_SERIALIZABLE,
     CONFLICT_ISOLATION_SNAPSHOT,
 )
-
-_STARTING_SEQ_NUMBER_WARNED = False
-
-
-def _warn_unused_starting_sequence_number_once() -> None:
-    global _STARTING_SEQ_NUMBER_WARNED
-    if _STARTING_SEQ_NUMBER_WARNED:
-        return
-    _STARTING_SEQ_NUMBER_WARNED = True
-    import warnings
-
-    warnings.warn(
-        "rewrite_data_files: option `use-starting-sequence-number` is accepted but "
-        "currently a no-op; default sequencing applies.",
-        stacklevel=3,
-    )
-
 
 def _parse_conflict_isolation(raw_options: dict[str, Any]) -> str:
     """Pop and validate the conflict-isolation option from ``raw_options``.
@@ -177,7 +163,11 @@ def run(
     normalized = _rust_iceberg.validate_options_py(raw_options)
 
     if "use-starting-sequence-number" in raw_options:
-        _warn_unused_starting_sequence_number_once()
+        raise ValueError(
+            "rewrite_data_files: option `use-starting-sequence-number` is not "
+            "supported. Output files are assigned sequence numbers at commit "
+            "time; remove the option to proceed."
+        )
 
     row_filter = where if where is not None else AlwaysTrue()
     scan_kwargs: dict[str, Any] = {"row_filter": row_filter}
@@ -250,17 +240,17 @@ def run(
             rewrite_id=rewrite_id,
         )
 
-    max_concurrent = max(
-        1, int(normalized.get("max-concurrent-file-group-rewrites", 1))
-    )
-    outputs = _rewrite_groups_concurrent(
+    io_config = _io_config_for_table(table)
+    outputs = _rewrite_groups(
         table=table,
         groups=groups,
+        plan_by_path=plan_by_path,
+        snapshot_id=starting_snapshot_id,
+        io_config=io_config,
         normalized_options=normalized,
         strategy=strategy,
         sort_order=parsed_sort_order,
         zorder_by=parsed_zorder_by,
-        max_workers=max_concurrent,
     )
 
     result = _commit(
@@ -282,44 +272,56 @@ def run(
     return result
 
 
-def _rewrite_groups_concurrent(
+def _io_config_for_table(table: PyIcebergTable) -> IOConfig:
+    """Resolve object-store access configuration for reading and writing a table.
+
+    Prefers the configuration recorded on the table, falling back to the process
+    default when none is set.
+    """
+    from daft.context import get_context
+    from daft.io.iceberg._iceberg import (
+        _convert_iceberg_file_io_properties_to_io_config,
+    )
+
+    io_config = _convert_iceberg_file_io_properties_to_io_config(table.io.properties)
+    if io_config is not None:
+        return io_config
+    return get_context().daft_planning_config.default_io_config
+
+
+def _rewrite_groups(
     *,
     table: PyIcebergTable,
     groups: list[dict[str, Any]],
+    plan_by_path: dict[str, Any],
+    snapshot_id: int | None,
+    io_config: IOConfig,
     normalized_options: dict[str, Any],
     strategy: str,
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
-    max_workers: int,
 ) -> list[_GroupOutput]:
-    from concurrent.futures import ThreadPoolExecutor
+    """Rewrite each file group in turn through the streaming engine.
 
-    if max_workers <= 1 or len(groups) <= 1:
-        return [
-            _rewrite_group(
-                table=table,
-                group=g,
-                normalized_options=normalized_options,
-                strategy=strategy,
-                sort_order=sort_order,
-                zorder_by=zorder_by,
-            )
-            for g in groups
-        ]
-
-    def _one(g: dict[str, Any]) -> _GroupOutput:
-        return _rewrite_group(
+    Groups are processed sequentially: within a group the read, optional
+    re-clustering, and write all stream through the execution engine, which
+    bounds peak memory to the engine's budget rather than the group's full
+    decompressed size. Running groups one at a time keeps that bound flat.
+    """
+    return [
+        _rewrite_group(
             table=table,
             group=g,
+            plan_by_path=plan_by_path,
+            snapshot_id=snapshot_id,
+            io_config=io_config,
             normalized_options=normalized_options,
             strategy=strategy,
             sort_order=sort_order,
             zorder_by=zorder_by,
         )
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        outputs = list(pool.map(_one, groups))
-    return outputs
+        for g in groups
+    ]
 
 
 def _augment_result_with_dangling(
@@ -427,74 +429,56 @@ def _rewrite_group(
     *,
     table: PyIcebergTable,
     group: dict[str, Any],
+    plan_by_path: dict[str, Any],
+    snapshot_id: int | None,
+    io_config: IOConfig,
     normalized_options: dict[str, Any],
     strategy: str,
     sort_order: list[tuple[str, bool, bool]] | None,
     zorder_by: list[str] | None,
 ) -> _GroupOutput:
-    from daft.expressions import col as col_expr
-    from daft.expressions.expressions import ExpressionsProjection
-    from daft.io.writer import IcebergWriter
-    from daft.recordbatch import MicroPartition
+    """Read one group's files, optionally re-cluster, and write target-sized outputs.
 
+    The read, sort or z-order, and write all flow through the streaming execution
+    engine, so peak memory is bounded by the engine's budget rather than the
+    group's full decompressed size. The written files are returned as metadata for
+    the caller to commit; nothing is committed here.
+    """
     input_paths = [f["path"] for f in group["files"]]
     input_delete_paths_nested = [f["positional_delete_paths"] for f in group["files"]]
     flat_delete_paths = sorted({p for sub in input_delete_paths_nested for p in sub})
     bytes_rewritten = sum(int(f["size_bytes"]) for f in group["files"])
 
     target_size = int(normalized_options["target-file-size-bytes"])
-    compression_factor = float(normalized_options.get("compression-factor", 1.0))
-    output_root = _group_output_root(table)
+    output_spec_id = int(group["output_spec_id"])
 
-    arrow_table = _to_arrow_for_paths(table, input_paths)
-    mp = MicroPartition.from_arrow(arrow_table)
+    df = _group_dataframe(
+        table=table,
+        input_paths=input_paths,
+        plan_by_path=plan_by_path,
+        snapshot_id=snapshot_id,
+        io_config=io_config,
+    )
 
     if strategy == "sort":
         assert sort_order is not None
-        sort_exprs = ExpressionsProjection(
-            [col_expr(name) for (name, _, _) in sort_order]
+        df = df.sort(
+            [name for (name, _, _) in sort_order],
+            desc=[descending for (_, descending, _) in sort_order],
+            nulls_first=[nulls_first for (_, _, nulls_first) in sort_order],
         )
-        descending = [d for (_, d, _) in sort_order]
-        nulls_first = [nf for (_, _, nf) in sort_order]
-        mp = mp.sort(sort_exprs, descending=descending, nulls_first=nulls_first)
     elif strategy == "zorder":
         assert zorder_by is not None
-        mp = _apply_zorder(mp, arrow_table, zorder_by, normalized_options)
+        df = _apply_zorder(df, zorder_by, normalized_options)
 
-    estimated_output_bytes = max(1, int(bytes_rewritten * compression_factor))
-    n_chunks = max(1, (estimated_output_bytes + target_size - 1) // target_size)
-    chunks = _split_micropartition(mp, int(n_chunks))
-
-    output_spec_id = int(group["output_spec_id"])
-    output_spec = table.specs()[output_spec_id]
-    schema = table.schema()
-    properties = table.properties
-
-    partition_values_rb = _build_partition_values_recordbatch(mp, output_spec, schema)
-
-    data_files: list[Any] = []
-    bytes_added = 0
-    for idx, chunk in enumerate(chunks):
-        if len(chunk) == 0:
-            continue
-        writer = IcebergWriter(
-            root_dir=output_root,
-            file_idx=idx,
-            schema=schema,
-            properties=properties,
-            partition_spec_id=output_spec_id,
-            partition_values=partition_values_rb,
-            io_config=None,
-        )
-        writer.write(chunk)
-        rb = writer.close()
-        df_list = rb.to_pylist()
-        for entry in df_list:
-            df_ = entry.get("data_file") if isinstance(entry, dict) else entry
-            if df_ is None:
-                continue
-            data_files.append(df_)
-            bytes_added += int(getattr(df_, "file_size_in_bytes", 0))
+    data_files = _collect_data_files(
+        df=df,
+        table=table,
+        io_config=io_config,
+        target_size=target_size,
+        output_spec_id=output_spec_id,
+    )
+    bytes_added = sum(int(getattr(d, "file_size_in_bytes", 0)) for d in data_files)
 
     return _GroupOutput(
         input_data_files=input_paths,
@@ -505,91 +489,88 @@ def _rewrite_group(
     )
 
 
-def _build_partition_values_recordbatch(
-    mp: Any,
-    output_spec: Any,
-    schema: Any,
-) -> Any | None:
-    from daft.expressions.expressions import ExpressionsProjection
-    from daft.io.iceberg.iceberg_write import partition_field_to_expr
-    from daft.recordbatch import RecordBatch as DaftRecordBatch
+def _group_dataframe(
+    *,
+    table: PyIcebergTable,
+    input_paths: list[str],
+    plan_by_path: dict[str, Any],
+    snapshot_id: int | None,
+    io_config: IOConfig,
+) -> DataFrame:
+    """Build a lazy frame over exactly the group's data files.
 
-    if not getattr(output_spec, "fields", None):
-        return None
-    if len(mp) == 0:
-        return None
-    # Group is partition-homogeneous; one row is representative of the whole group.
-    head_mp = mp.slice(0, 1)
-    proj = ExpressionsProjection(
-        [partition_field_to_expr(f, schema) for f in output_spec.fields]
+    The frame reads each file with the table's read schema (resolving field ids)
+    and applies any positional delete files during the read, matching a normal
+    table read but restricted to this group.
+    """
+    from daft import runners
+    from daft.daft import ScanOperatorHandle, StorageConfig
+    from daft.dataframe import DataFrame
+    from daft.io.iceberg.iceberg_scan import IcebergFileGroupScanOperator
+    from daft.logical.builder import LogicalPlanBuilder
+
+    tasks = [plan_by_path[path] for path in input_paths]
+    multithreaded_io = runners.get_or_create_runner().name != "ray"
+    storage_config = StorageConfig(multithreaded_io, io_config)
+    operator = IcebergFileGroupScanOperator(
+        table, snapshot_id=snapshot_id, storage_config=storage_config, tasks=tasks
     )
-    transformed = head_mp.eval_expression_list(proj)
-    return DaftRecordBatch.from_arrow_table(transformed.to_arrow())
+    handle = ScanOperatorHandle.from_python_scan_operator(operator)
+    builder = LogicalPlanBuilder.from_tabular_scan(scan_operator=handle)
+    return DataFrame(builder)
 
 
 def _apply_zorder(
-    mp: Any,
-    arrow_table: Any,
+    df: DataFrame,
     zorder_by: list[str],
     normalized_options: dict[str, Any],
-) -> Any:
+) -> DataFrame:
+    """Cluster rows along a space-filling curve over the given columns.
+
+    A single ordered key is derived from the columns and the frame is sorted by
+    it, then the key is dropped so the output schema matches the input. The key is
+    computed as a streaming expression so no full copy of the group is held.
+    """
     from daft.expressions import col as col_expr
-    from daft.expressions.expressions import ExpressionsProjection
-    from daft.recordbatch import MicroPartition
+    from daft.io.iceberg._zorder import zorder_key
 
     var_len = int(normalized_options["var-length-contribution"])
     max_out = int(normalized_options["max-output-size"])
-    key_array = _rust_iceberg.build_zorder_key_py(
-        [arrow_table.column(c).combine_chunks() for c in zorder_by],
-        var_len,
-        max_out,
-    )
-
-    augmented_arrow = arrow_table.append_column(_ZORDER_KEY_COL, key_array)
-    augmented = MicroPartition.from_arrow(augmented_arrow)
-    sort_exprs = ExpressionsProjection([col_expr(_ZORDER_KEY_COL)])
-    sorted_mp = augmented.sort(sort_exprs, descending=False, nulls_first=True)
-
-    keep_cols = [c for c in arrow_table.column_names if c != _ZORDER_KEY_COL]
-    return sorted_mp.eval_expression_list(
-        ExpressionsProjection([col_expr(c) for c in keep_cols])
+    key = zorder_key([col_expr(c) for c in zorder_by], var_len, max_out)
+    return (
+        df.with_column(_ZORDER_KEY_COL, key)
+        .sort(_ZORDER_KEY_COL, desc=False, nulls_first=True)
+        .exclude(_ZORDER_KEY_COL)
     )
 
 
-def _split_micropartition(mp: Any, n: int) -> list[Any]:
-    total = len(mp)
-    if n <= 1 or total <= 1:
-        return [mp]
-    step = (total + n - 1) // n
-    out = []
-    for start in range(0, total, step):
-        out.append(mp.slice(start, min(start + step, total)))
-    return out
+def _collect_data_files(
+    *,
+    df: DataFrame,
+    table: PyIcebergTable,
+    io_config: IOConfig,
+    target_size: int,
+    output_spec_id: int,
+) -> list[Any]:
+    """Write the frame's rows as target-sized data files and return their metadata.
 
+    The write streams through the engine, rolling a new file each time the target
+    size is reached and partitioning rows by the chosen spec. The destination is
+    not committed; the returned descriptors are handed to the commit step.
+    """
+    from daft.dataframe import DataFrame
 
-# Use a field-id-aware Arrow scan so schema evolution resolves correctly and
-# positional delete files are applied during read.
-def _to_arrow_for_paths(table: PyIcebergTable, paths: list[str]):
-    from pyiceberg.io.pyarrow import ArrowScan
-
-    scan = table.scan()
-    plan_files = list(scan.plan_files())
-    wanted = {p for p in paths}
-    tasks = [t for t in plan_files if t.file.file_path in wanted]
-    if not tasks:
-        raise ValueError(f"no plan_files matched: {paths!r}")
-    arrow_scan = ArrowScan(
-        table_metadata=table.metadata,
-        io=table.io,
-        projected_schema=scan.projection(),
-        row_filter=scan.row_filter,
-        case_sensitive=scan.case_sensitive,
+    write_builder = df._builder.write_iceberg(
+        table,
+        io_config,
+        target_file_size_bytes=target_size,
+        partition_spec_id=output_spec_id,
     )
-    return arrow_scan.to_table(tasks)
-
-
-def _group_output_root(table: PyIcebergTable) -> str:
-    return f"{table.location().rstrip('/')}/data"
+    write_df = DataFrame(write_builder)
+    write_df.collect()
+    result = write_df.to_pydict()
+    data_files = result.get("data_file", [])
+    return [data_file for data_file in data_files if data_file is not None]
 
 
 # Partition records are positional with no named attrs; iterate the tuple values.

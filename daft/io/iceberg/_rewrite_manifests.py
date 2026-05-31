@@ -14,7 +14,7 @@ import hashlib
 import logging
 import uuid as _uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from daft.io.iceberg._common import (
     CommitRetryExhausted,
@@ -23,8 +23,19 @@ from daft.io.iceberg._common import (
 )
 
 if TYPE_CHECKING:
-    from pyiceberg.manifest import ManifestFile
+    from pyiceberg.manifest import ManifestEntry, ManifestFile, ManifestWriter
+    from pyiceberg.partitioning import PartitionSpec
     from pyiceberg.table import Table as PyIcebergTable
+
+
+class _ManifestWriterFactory(Protocol):
+    """Supplies a fresh manifest writer bound to a partition spec.
+
+    Implemented by the snapshot producer; the rolling writer depends only on
+    this method, so it is typed against the capability rather than the producer.
+    """
+
+    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter: ...
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +122,10 @@ def run(
             f"manifest-target-size-bytes must be > 0, got {target_size_bytes!r}"
         )
 
-    _ = use_caching
+    # Accepted for interface compatibility. Entries are read exactly once per
+    # input manifest as they stream into the rollers, so there is no shared
+    # intermediate to cache; the flag has no effect here.
+    del use_caching
 
     validate_gc_enabled(table)
 
@@ -213,11 +227,17 @@ def _plan(
             no_op_reason=f"branch {target_branch!r} has no current snapshot",
         )
 
+    from pyiceberg.manifest import ManifestContent
+
     manifests = list(snapshot.manifests(table.io))
     matching: list[ManifestFile] = []
     untouched: list[ManifestFile] = []
     for m in manifests:
-        if int(m.partition_spec_id) == int(spec_id):
+        # Repack only data manifests for the chosen spec. Delete manifests (and
+        # manifests for other specs) are carried through untouched: their entries
+        # are written through a different content path and must not be folded into
+        # data manifests.
+        if int(m.partition_spec_id) == int(spec_id) and m.content == ManifestContent.DATA:
             matching.append(m)
         else:
             untouched.append(m)
@@ -428,14 +448,15 @@ def _producer_class() -> type:
             if not self._plan.matching_manifests:
                 return
 
+            roll_at_bytes = int(self._target_size_bytes * _ROLL_FACTOR)
+            # Entry-count budget used only when the writer cannot report a running
+            # byte size; derived from the average entry size across the input set.
             avg_bytes = max(
                 1,
                 self._plan.bytes_rewritten
                 // max(1, self._plan.total_live_entries),
             )
-            roll_target_entries = max(
-                1, int(self._target_size_bytes * _ROLL_FACTOR / avg_bytes)
-            )
+            fallback_roll_at_entries = max(1, int(roll_at_bytes / avg_bytes))
 
             rollers: dict[tuple[int, tuple[Any, ...]], _RollingManifestWriter] = {}
 
@@ -453,7 +474,8 @@ def _producer_class() -> type:
                         roller = _RollingManifestWriter(
                             producer=self,
                             spec=spec,
-                            roll_at_entries=roll_target_entries,
+                            roll_at_bytes=roll_at_bytes,
+                            fallback_roll_at_entries=fallback_roll_at_entries,
                         )
                         rollers[key] = roller
                     roller.add(
@@ -476,23 +498,44 @@ def _producer_class() -> type:
 
 
 class _RollingManifestWriter:
-    """Open a new manifest every ``roll_at_entries`` entries."""
+    """Roll to a new manifest once the bytes written reach the target size.
 
-    def __init__(self, *, producer: _RewriteManifests, spec: Any, roll_at_entries: int):
+    Each added entry is serialized immediately, so the writer's running output
+    size is tracked and a new manifest is started when it reaches the byte
+    target. When the writer cannot report a running size, an entry-count budget
+    derived from the average entry size is used instead, keeping output bounded
+    either way.
+    """
+
+    def __init__(
+        self,
+        *,
+        producer: _ManifestWriterFactory,
+        spec: PartitionSpec,
+        roll_at_bytes: int,
+        fallback_roll_at_entries: int,
+    ):
         self._producer = producer
         self._spec = spec
-        self._roll_at = max(1, roll_at_entries)
-        self._writer: Any = None
+        self._roll_at_bytes = max(1, roll_at_bytes)
+        self._fallback_roll_at_entries = max(1, fallback_roll_at_entries)
+        self._writer: ManifestWriter | None = None
         self._count = 0
         self._finished: list[ManifestFile] = []
 
-    def add(self, entry: Any) -> None:
-        if self._writer is None or self._count >= self._roll_at:
+    def add(self, entry: ManifestEntry) -> None:
+        if self._writer is None or self._should_roll():
             self._close_writer()
             self._writer = self._producer.new_manifest_writer(self._spec).__enter__()  # type: ignore[attr-defined]
             self._count = 0
         self._writer.add_entry(entry)
         self._count += 1
+
+    def _should_roll(self) -> bool:
+        written = _manifest_writer_bytes(self._writer)
+        if written is not None:
+            return written >= self._roll_at_bytes
+        return self._count >= self._fallback_roll_at_entries
 
     def _close_writer(self) -> None:
         if self._writer is None:
@@ -504,6 +547,22 @@ class _RollingManifestWriter:
     def finish(self) -> list[ManifestFile]:
         self._close_writer()
         return self._finished
+
+
+def _manifest_writer_bytes(writer: ManifestWriter | None) -> int | None:
+    """Return the bytes written so far by an open manifest writer, or ``None``.
+
+    Reads the position of the underlying output stream, which advances as each
+    entry is serialized. Returns ``None`` when no running position is available.
+    """
+    output_stream = getattr(getattr(writer, "_writer", None), "output_stream", None)
+    tell = getattr(output_stream, "tell", None)
+    if tell is None:
+        return None
+    try:
+        return int(tell())
+    except (OSError, ValueError):
+        return None
 
 
 def _partition_key_tuple(data_file: Any) -> tuple[Any, ...]:
